@@ -71,7 +71,11 @@ Module._load = function (request) {
 /* ------------------------------------------------------- installed ext modules */
 
 const { getModelProfile, parseClaudeVersion } = require(path.join(OUT, "profiles.js"));
-const { buildRequestInput } = require(path.join(OUT, "converters/request.js"));
+const { buildRequestInput, minMaxTokensForEffort } = require(path.join(OUT, "converters/request.js"));
+const {
+	describeThinkingBudgetConflict,
+	explainBedrockValidationError,
+} = require(path.join(OUT, "validation.js"));
 const { applyCachePoints } = require(path.join(OUT, "converters/cache-points.js"));
 const { StreamProcessor } = require(path.join(OUT, "stream-processor.js"));
 const { UsageTracker } = require(path.join(OUT, "usage-tracker.js"));
@@ -210,6 +214,143 @@ await test("maxOutputTokens override is honoured and clamped to the ceiling", as
 	return "500 honoured; 999999 clamped to 8192";
 });
 
+await test("a maxOutputTokens setting of 0 resolves to the model ceiling, not 1", async () => {
+	// The setting's own default is 0, documented as "use the model maximum", but
+	// it was selected with `?? ceiling`, which does not treat 0 as absent. A
+	// literal 0 therefore won and every request Copilot sent no max_tokens with
+	// went out as maxTokens: 1. This exact value was the one never tested.
+	for (const sentinel of [0, undefined, -1]) {
+		const built = buildRequestInput({
+			model: model(CHEAP, 64000), converted: { messages: [userMsg("hi")], system: [] },
+			options: {}, profile: getModelProfile(CHEAP), maxOutputTokensOverride: sentinel,
+		});
+		assert.strictEqual(built.input.inferenceConfig.maxTokens, 64000, `sentinel ${String(sentinel)} leaked`);
+		assert.strictEqual(built.maxTokens.source, "model-ceiling");
+	}
+	return "0 / undefined / -1 all fall through to the ceiling";
+});
+
+await test("default settings + thinking produce a valid max_tokens/budget pair", async () => {
+	// The reported failure: maxOutputTokens unset, thinking on at effort high.
+	// Bedrock rejected it with "max_tokens must be greater than
+	// thinking.budget_tokens" because maxTokens had resolved to 1.
+	const notes = [];
+	for (const [id, ceiling] of [[ADAPTIVE, 64000], [CHEAP, 32000]]) {
+		const built = buildRequestInput({
+			model: model(id, ceiling), converted: { messages: [userMsg("hi")], system: [] },
+			options: {}, profile: getModelProfile(id), maxOutputTokensOverride: 0,
+			thinking: { enabled: true, effort: "high", budgetTokens: 0 },
+		});
+		assert.strictEqual(built.thinkingEnabled, true, `${id}: thinking must survive`);
+		assert.strictEqual(built.maxTokens.conflict, undefined, `${id}: unexpected conflict`);
+		const max = built.input.inferenceConfig.maxTokens;
+		const budget = built.input.additionalModelRequestFields.reasoning_config?.budget_tokens;
+		assert.ok(max >= minMaxTokensForEffort("high"), `${id}: maxTokens ${max} has no headroom`);
+		if (budget !== undefined) {
+			assert.ok(budget < max, `${id}: budget ${budget} >= maxTokens ${max}`);
+		}
+		notes.push(`${id.split(".").pop()}: max=${max}${budget ? ` budget=${budget}` : " (adaptive)"}`);
+	}
+	return notes.join("; ");
+});
+
+await test("an explicit cap too small for the effort is reported, not sent invalid", async () => {
+	const built = buildRequestInput({
+		model: model(ADAPTIVE, 64000), converted: { messages: [userMsg("hi")], system: [] },
+		options: {}, profile: getModelProfile(ADAPTIVE), maxOutputTokensOverride: 500,
+		thinking: { enabled: true, effort: "high", budgetTokens: 0 },
+	});
+	assert.strictEqual(built.input.inferenceConfig.maxTokens, 500, "an explicit cap stays honoured");
+	assert.strictEqual(built.thinkingEnabled, false, "thinking must be dropped, not sent invalid");
+	assert.ok(built.maxTokens.conflict, "the impossible pair must be reported to the caller");
+	assert.strictEqual(built.input.additionalModelRequestFields, undefined);
+	return `conflict surfaced; needs >= ${built.maxTokens.conflict.requiredMaxTokens}`;
+});
+
+await test("invariant: no effort/API/setting/request combination yields an invalid pair", async () => {
+	// Property-style sweep, because every bug in this area has been a single point
+	// in this space that example-based tests happened to miss. `request` is a
+	// dimension because Copilot supplies its own small max_tokens for utility
+	// calls, and that is where the adaptive API broke.
+	let n = 0;
+	for (const id of [ADAPTIVE, CHEAP]) {
+		for (const effort of THINKING_EFFORTS) {
+			for (const setting of [0, 1, 500, 1024, 4096, 32000, 999999, undefined]) {
+				for (const request of [undefined, 500, 3000, 8192, 20480]) {
+				for (const ceiling of [8192, 32000, 128000]) {
+					n++;
+					const built = buildRequestInput({
+						model: model(id, ceiling), converted: { messages: [userMsg("hi")], system: [] },
+						options: request === undefined ? {} : { modelOptions: { max_tokens: request } },
+						profile: getModelProfile(id), maxOutputTokensOverride: setting,
+						thinking: { enabled: true, effort, budgetTokens: 0 },
+					});
+					const where = `${id} ${effort} setting=${String(setting)} request=${String(request)} ceiling=${ceiling}`;
+					const max = built.input.inferenceConfig.maxTokens;
+					assert.ok(max >= 1 && max <= ceiling, `${where}: maxTokens ${max} out of range`);
+					const fields = built.input.additionalModelRequestFields;
+					const budget = fields?.reasoning_config?.budget_tokens;
+					if (built.thinkingEnabled) {
+						assert.ok(max >= 2048, `${where}: thinking on with only ${max} output tokens`);
+						if (budget !== undefined) {
+							assert.ok(budget >= 1024, `${where}: budget ${budget} below Anthropic's floor`);
+							assert.ok(budget < max, `${where}: budget ${budget} >= maxTokens ${max}`);
+						}
+						// The adaptive API sends no budget, so the level it does send must be
+						// one whose server-derived budget fits, and never above what was asked.
+						if (getModelProfile(id).thinkingApi === "adaptive") {
+							const sent = fields.output_config.effort;
+							assert.ok(
+								max >= minMaxTokensForEffort(sent),
+								`${where}: sent "${sent}" needing ${minMaxTokensForEffort(sent)} with only ${max}`
+							);
+							assert.ok(
+								THINKING_EFFORTS.indexOf(sent) <= THINKING_EFFORTS.indexOf(effort),
+								`${where}: effort raised to "${sent}"`
+							);
+						}
+					} else {
+						assert.strictEqual(budget, undefined, `${where}: budget sent with thinking off`);
+						// Thinking is dropped either because an explicit cap conflicts, or
+						// because the adaptive API has no level small enough to fit: its
+						// budget is derived server-side from the effort, so there is nothing
+						// to trim when even "low" does not fit.
+						const adaptiveTooSmall =
+							getModelProfile(id).thinkingApi === "adaptive" && max < minMaxTokensForEffort("low");
+						assert.ok(
+							built.maxTokens.conflict || adaptiveTooSmall,
+							`${where}: thinking dropped with no explanation`
+						);
+					}
+				}
+				}
+			}
+		}
+	}
+	return `${n} combinations, all valid`;
+});
+
+await test("thinking budget conflicts are explained in terms of settings", async () => {
+	const msg = describeThinkingBudgetConflict({
+		maxTokens: 500, requiredMaxTokens: 20480, effort: "high", source: "setting", ceiling: 128000,
+	});
+	assert.ok(msg.includes("maxOutputTokens"), "must name the setting the user can change");
+	assert.ok(msg.includes("high"), "must name the effort level");
+
+	// The exact string Bedrock returned in the report.
+	const raw = "The model returned the following errors: `max_tokens` must be greater than `thinking.budget_tokens`.";
+	const explained = explainBedrockValidationError(raw, { maxTokens: 1, effort: "high", thinkingEnabled: true });
+	assert.ok(explained, "the reported Bedrock error must be recognized");
+	assert.ok(explained.includes("maxOutputTokens"), "must translate to a setting name");
+	assert.ok(explained.includes(raw), "must preserve the original for diagnosis");
+
+	assert.strictEqual(
+		explainBedrockValidationError("AccessDeniedException: not authorized", { thinkingEnabled: true }),
+		undefined, "unrelated errors must pass through untouched"
+	);
+	return "conflict + Bedrock rejection translated; unrelated untouched";
+});
+
 await test("profiles: caching + thinking API detected per model", async () => {
 	const h = getModelProfile(CHEAP);
 	assert.strictEqual(h.supportsPromptCaching, true);
@@ -344,6 +485,43 @@ await test("effort precedence: a picked variant beats the status bar default", a
 	// A stale or hand-typed suffix must degrade, not fail the request.
 	assert.deepStrictEqual(decodeVariantId(`${ADAPTIVE}#think=extreme`), { baseId: ADAPTIVE });
 	return "variant > default; unknown suffix degrades to base";
+});
+
+await test("the off variant is the only way to suppress reasoning for one conversation", async () => {
+	// Without this row the picker could only ever raise reasoning: every effort
+	// variant returns enabled:true, and the plain row inherits the global default.
+	const pickerId = encodeVariantId(ADAPTIVE, "off");
+	assert.strictEqual(pickerId, `${ADAPTIVE}#think=off`);
+	const { baseId, effort } = decodeVariantId(pickerId);
+	assert.strictEqual(baseId, ADAPTIVE, "no suffix may reach the wire");
+
+	assert.deepStrictEqual(resolveThinkingForTurn(effort, { enabled: true, effort: "high" }),
+		{ enabled: false, effort: "high", source: "model-picker" });
+
+	// Nothing reasoning-related may reach the request, and with no reasoning there
+	// is nothing to reserve output tokens for.
+	const built = buildRequestInput({
+		model: model(baseId, 64000), converted: { messages: [userMsg("hi")], system: [] },
+		options: {}, profile: getModelProfile(baseId), maxOutputTokensOverride: 0,
+		thinking: { enabled: false, effort: "high", budgetTokens: 0 },
+	});
+	assert.strictEqual(built.thinkingEnabled, false);
+	assert.strictEqual(built.input.additionalModelRequestFields, undefined);
+	assert.strictEqual(built.input.inferenceConfig.maxTokens, 64000);
+
+	// The row exists only to override a default that is on.
+	const withDefault = expandEffortVariants(
+		{ id: ADAPTIVE, name: "Claude Sonnet 4.6", maxInputTokens: 200000, maxOutputTokens: 64000, capabilities: {} },
+		{ thinkingEnabledByDefault: true }
+	);
+	assert.strictEqual(withDefault.length, 2 + THINKING_EFFORTS.length);
+	assert.strictEqual(decodeVariantId(withDefault[1].id).effort, "off", "off must lead the variants");
+	const withoutDefault = expandEffortVariants(
+		{ id: ADAPTIVE, name: "Claude Sonnet 4.6", maxInputTokens: 200000, maxOutputTokens: 64000, capabilities: {} },
+		{ thinkingEnabledByDefault: false }
+	);
+	assert.ok(withoutDefault.every((v) => decodeVariantId(v.id).effort !== "off"));
+	return `off suppresses a "high" default; ${withDefault.length} rows with it, ${withoutDefault.length} without`;
 });
 
 await test("effort variants LIVE: a variant-derived effort is accepted by Bedrock", async () => {

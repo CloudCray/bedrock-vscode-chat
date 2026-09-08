@@ -15,9 +15,19 @@ import { convertTools } from "../converters/tools";
 import { buildRequestInput } from "../converters/request";
 import { getModelProfile } from "../profiles";
 import { decodeVariantId, resolveThinkingForTurn } from "../thinking-variants";
-import { validateRequest } from "../validation";
+import {
+	validateRequest,
+	describeThinkingBudgetConflict,
+	explainBedrockValidationError,
+	MAX_OUTPUT_TOKENS_SETTING,
+} from "../validation";
+import {
+	showConfigurationProblem,
+	reportConfigurationError,
+	actionsForTokenLimit,
+} from "../config-actions";
 import { logger } from "../logger";
-import { ModelService } from "../services/model.service";
+import { ModelService, defaultMaxOutputTokens } from "../services/model.service";
 import { AuthenticationService } from "../services/authentication.service";
 import { ConfigurationService } from "../services/configuration.service";
 import { TokenEstimator } from "./token.estimator";
@@ -31,6 +41,24 @@ import type { BedrockMessage, ReasoningBlock, ToolCallFailure } from "../types";
  * rather than grown without bound for the life of the window.
  */
 const MAX_REASONING_ENTRIES = 64;
+
+/**
+ * Marker for errors whose message has already been shown to the user.
+ *
+ * The catch block is the single place that surfaces failures, but the
+ * configuration pre-flight needs to show its own actionable message before
+ * throwing. Without a marker the user would get two toasts for one problem.
+ */
+const REPORTED = Symbol("bedrock.errorReported");
+
+function markReported<T extends Error>(err: T): T {
+	(err as unknown as Record<symbol, boolean>)[REPORTED] = true;
+	return err;
+}
+
+function wasReported(err: unknown): boolean {
+	return Boolean(err && typeof err === "object" && (err as Record<symbol, boolean>)[REPORTED]);
+}
 
 /**
  * Handles chat request processing for Bedrock models.
@@ -102,6 +130,16 @@ export class ChatRequestHandler {
 		const abortController = new AbortController();
 		const cancellationSubscription = token.onCancellationRequested(() => abortController.abort());
 
+		// Populated as the request is assembled so the catch block can explain a
+		// failure in terms of what was actually sent.
+		const diagnostics: {
+			maxTokens?: number;
+			effort?: string;
+			thinkingEnabled?: boolean;
+			/** Whether a user setting, rather than the model, set the limit. */
+			maxTokensFromSetting?: boolean;
+		} = {};
+
 		try {
 			const authConfig = await this.authService.getAuthConfig();
 			if (!authConfig) {
@@ -156,6 +194,9 @@ export class ChatRequestHandler {
 				profile,
 				toolConfig,
 				maxOutputTokensOverride: this.configService.getMaxOutputTokens(),
+				// If VS Code hands back a model with no usable ceiling, fall back to the
+				// family default rather than letting a pathological value through.
+				fallbackMaxOutputTokens: defaultMaxOutputTokens(modelId),
 				thinking: {
 					enabled: thinkingRequested,
 					effort: thinking.effort,
@@ -164,6 +205,65 @@ export class ChatRequestHandler {
 				promptCaching: this.configService.isPromptCachingEnabled(),
 			});
 			const requestInput = built.input;
+			const resolution = built.maxTokens;
+
+			diagnostics.maxTokens = resolution.maxTokens;
+			diagnostics.thinkingEnabled = built.thinkingEnabled;
+			diagnostics.effort = built.thinkingEnabled ? thinking.effort : undefined;
+			diagnostics.maxTokensFromSetting = resolution.source === "setting";
+
+			// Fail before the API call when an explicit cap cannot house the requested
+			// reasoning budget. Bedrock would reject this too, but its message names
+			// wire fields rather than the settings the user would have to change.
+			if (resolution.conflict) {
+				const detail = describeThinkingBudgetConflict(resolution.conflict);
+				logger.error("[Chat Request Handler] Output-token limit too small for thinking", resolution.conflict);
+				void showConfigurationProblem(
+					detail,
+					actionsForTokenLimit(resolution.conflict.source === "setting")
+				);
+				throw markReported(new Error(detail));
+			}
+
+			// One line showing the whole precedence chain, not just the outcome. The
+			// `maxTokens: 1` regression was invisible for exactly this reason: the log
+			// showed the final value with no indication of which input produced it.
+			logger.log("[Chat Request Handler] Resolved output-token limit", {
+				maxTokens: resolution.maxTokens,
+				source: resolution.source,
+				modelCeiling: resolution.ceiling,
+				thinkingFloor: resolution.thinkingFloor,
+				thinkingBudget: resolution.budgetTokens,
+				...(resolution.effort && { effort: resolution.effort }),
+				...(resolution.clampedToCeiling && { clampedToCeiling: true }),
+			});
+
+			// The adaptive API derives its budget from the effort level server-side,
+			// so a caller-supplied max_tokens smaller than that budget can only be
+			// accommodated by asking for less effort. Say so, because the user set a
+			// level and is getting a different one.
+			if (resolution.effortDowngradedFrom) {
+				logger.warn(
+					`[Chat Request Handler] Reasoning effort reduced from "${resolution.effortDowngradedFrom}" to ` +
+						`"${resolution.effort}" for this request: it allows ${resolution.maxTokens} output tokens, ` +
+						`which cannot accommodate the higher level's reasoning budget.`
+				);
+			}
+
+			if (thinkingRequested && !built.thinkingEnabled && profile.thinkingApi !== "none") {
+				logger.warn(
+					"[Chat Request Handler] Extended thinking dropped for this turn: the output-token limit " +
+						`of ${resolution.maxTokens} cannot accommodate a reasoning budget.`
+				);
+			}
+
+			if (resolution.source === "setting" && resolution.maxTokens < resolution.ceiling) {
+				logger.warn(
+					`[Chat Request Handler] "${MAX_OUTPUT_TOKENS_SETTING}" limits responses to ` +
+						`${resolution.maxTokens} of the model's ${resolution.ceiling} output tokens. ` +
+						"Set it to 0 to use the model maximum; a low cap truncates large tool calls."
+				);
+			}
 
 			// Substitute invocation target (override ARN or system profile) at the wire level.
 			// This keeps the bare model ID for getModelProfile() so capability detection
@@ -242,7 +342,8 @@ export class ChatRequestHandler {
 						result.toolCallFailures,
 						result.stopReason,
 						requestInput.inferenceConfig?.maxTokens ?? 0,
-						model.maxOutputTokens
+						model.maxOutputTokens,
+						resolution.source
 					)
 				);
 			}
@@ -253,16 +354,60 @@ export class ChatRequestHandler {
 				return;
 			}
 
-			const errorMsg = err instanceof Error ? err.message : String(err);
+			const rawMsg = err instanceof Error ? err.message : String(err);
 			logger.error("[Chat Request Handler] Chat request failed", {
 				modelId: model.id,
 				messageCount: messages.length,
+				...diagnostics,
 				error: err instanceof Error ? { name: err.name, message: err.message } : String(err),
 			});
-			vscode.window.showErrorMessage(`Bedrock chat request failed: ${errorMsg}`);
+
+			// Already explained and shown to the user by a pre-flight check, so do not
+			// raise a second toast for the same problem.
+			if (wasReported(err)) {
+				throw err;
+			}
+
+			// Bedrock's own validation messages name wire fields (`max_tokens`,
+			// `thinking.budget_tokens`) that match no setting the user can find.
+			// Translate the ones we recognize into the remedy.
+			const explained = explainBedrockValidationError(rawMsg, {
+				maxTokens: diagnostics.maxTokens,
+				effort: diagnostics.effort,
+				thinkingEnabled: diagnostics.thinkingEnabled,
+			});
+			if (explained) {
+				void showConfigurationProblem(explained, actionsForTokenLimit(diagnostics.maxTokensFromSetting ?? true));
+				throw markReported(new Error(explained));
+			}
+
+			// Auth, region and model-access failures are configuration problems too, and
+			// were previously reported as bare text with nothing to click.
+			if (await reportConfigurationError(rawMsg)) {
+				throw markReported(err instanceof Error ? err : new Error(rawMsg));
+			}
+
+			vscode.window.showErrorMessage(`Bedrock chat request failed: ${rawMsg}`);
+			// Rethrow the original so its type and stack survive for anything
+			// upstream that inspects them.
 			throw err;
 		} finally {
 			cancellationSubscription.dispose();
+		}
+	}
+
+	/**
+	 * Show a configuration failure with the two actions that can actually resolve
+	 * it, rather than a message the user has to translate into a settings search.
+	 */
+	private async offerMaxTokensFix(message: string): Promise<void> {
+		const openSetting = "Open Setting";
+		const changeEffort = "Change Thinking Effort";
+		const choice = await vscode.window.showErrorMessage(message, openSetting, changeEffort);
+		if (choice === openSetting) {
+			await vscode.commands.executeCommand("workbench.action.openSettings", MAX_OUTPUT_TOKENS_SETTING);
+		} else if (choice === changeEffort) {
+			await vscode.commands.executeCommand("bedrock.selectThinkingEffort");
 		}
 	}
 
@@ -399,16 +544,25 @@ export function describeToolCallFailure(
 	failures: readonly ToolCallFailure[],
 	stopReason: string | undefined,
 	maxTokens: number,
-	modelMaxOutputTokens: number
+	modelMaxOutputTokens: number,
+	/** Which input decided the cap, so the remedy names the right one. */
+	maxTokensSource?: "request" | "setting" | "model-ceiling"
 ): string {
 	const names = failures.map((f) => f.name ?? `#${f.index}`).join(", ");
 
 	if (stopReason === "max_tokens") {
 		const ceiling = modelMaxOutputTokens > 0 ? ` The model allows up to ${modelMaxOutputTokens}.` : "";
+		// Telling the user to raise the setting is wrong when it is already at its
+		// "use the model maximum" default, or when the cap came from the request.
+		const remedy =
+			maxTokensSource === "setting"
+				? `Set "${MAX_OUTPUT_TOKENS_SETTING}" to 0 to use the model's maximum, or ask for a smaller change, then retry.`
+				: maxTokensSource === "model-ceiling"
+					? `That is already this model's maximum, so ask for a smaller change — for example one file at a time — then retry.`
+					: `Ask for a smaller change, then retry. If you set "${MAX_OUTPUT_TOKENS_SETTING}", set it to 0 to use the model's maximum.`;
 		return (
 			`The model ran out of output tokens partway through a tool call (${names}), so its arguments were cut off ` +
-			`and could not be used. The response was limited to ${maxTokens} output tokens.${ceiling} ` +
-			`Raise "languageModelChatProvider.bedrock.maxOutputTokens" or ask for a smaller change, then retry.`
+			`and could not be used. The response was limited to ${maxTokens} output tokens.${ceiling} ${remedy}`
 		);
 	}
 

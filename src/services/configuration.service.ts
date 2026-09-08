@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { AuthMethod, ManualModel } from "../types";
 import type { ThinkingEffort } from "../converters/request";
+import { MIN_THINKING_BUDGET } from "../converters/request";
 import type { ThinkingDisplay } from "../thinking";
 
 /**
@@ -105,12 +106,20 @@ export class ConfigurationService {
 
 	/**
 	 * Explicit token budget for models on the legacy thinking API.
-	 * 0 means "derive it from the effort level".
+	 *
+	 * Returns `undefined` rather than `0` for "derive it from the effort level".
+	 * The settings UI uses `0` as that sentinel, but a numeric `0` survives `??`
+	 * and has already caused one production bug by winning a precedence chain it
+	 * was meant to fall through (see {@link getMaxOutputTokens}), so the sentinel
+	 * is destroyed here at the boundary instead of being passed inward.
 	 */
-	getThinkingBudgetTokens(): number {
+	getThinkingBudgetTokens(): number | undefined {
 		const config = vscode.workspace.getConfiguration(this.configSection);
-		const value = config.get<number>('thinking.budgetTokens') ?? 0;
-		return value > 0 ? Math.max(1024, value) : 0;
+		const value = config.get<number>('thinking.budgetTokens');
+		if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+			return undefined;
+		}
+		return Math.max(MIN_THINKING_BUDGET, Math.floor(value));
 	}
 
 	/**
@@ -160,13 +169,23 @@ export class ConfigurationService {
 	}
 
 	/**
-	 * User cap on output tokens per response. 0 means "use the model's maximum",
-	 * which is the default: a low cap truncates large tool calls mid-JSON.
+	 * User cap on output tokens per response, or `undefined` for "use the model's
+	 * maximum" — which is the default, because a low cap truncates large tool
+	 * calls mid-JSON.
+	 *
+	 * Returns `undefined` rather than the `0` the settings UI uses. The previous
+	 * signature returned `0`, and the request builder selected it with
+	 * `?? modelCeiling`, which only falls through on `null`/`undefined`. The
+	 * default configuration therefore sent `maxTokens: 1` on every request where
+	 * Copilot did not supply its own value.
 	 */
-	getMaxOutputTokens(): number {
+	getMaxOutputTokens(): number | undefined {
 		const config = vscode.workspace.getConfiguration(this.configSection);
-		const value = config.get<number>('maxOutputTokens') ?? 0;
-		return value > 0 ? value : 0;
+		const value = config.get<number>('maxOutputTokens');
+		if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+			return undefined;
+		}
+		return Math.floor(value);
 	}
 
 	/**
