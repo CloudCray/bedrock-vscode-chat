@@ -30,4 +30,6 @@ Precedence is a single rule: a variant picked in the chat window wins, and
 anything else falls back to the global default, which can itself be off.
 
 See **Choosing an effort level** in the [README](../../README.md#choosing-an-effort-level)
-for how it ended up working.
+for how it ended up working, and [docs/screenshots/](../screenshots/) for what the
+built version actually looks like. The screenshots supersede these drawings
+wherever the two disagree.

@@ -43,7 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - 131 offline unit tests, up from 59, covering the tool-buffer fixes, stream results and error handling, cache-point placement, tool-block reconciliation, thinking configuration and display, effort-variant encoding and precedence, usage tracking, token estimation across every part type, and per-model output ceilings. Every file touched is lint-clean.
 - `scripts/live-feature-test.js`, a live end-to-end harness that drives the compiled modules against real Bedrock and asserts on the responses: cache checkpoints reading back across turns, signed reasoning on both thinking APIs, a multi-kilobyte tool call arriving as parseable JSON, an effort variant decoding back to an invocable model ID, mid-stream fault propagation, and usage captured from the metadata event. Verified 22/22 against Claude Haiku 4.5 and Sonnet 4.6 in `us-west-2`.
-- `docs/mockups/` records the four UI options considered for where the effort control should live, and why the status bar plus optional picker variants won.
+- `docs/mockups/` records the four UI options considered for where the effort control should live, and why the status bar plus optional picker variants won. `docs/screenshots/` shows what the built version looks like, and supersedes the mockups where the two disagree.
 - Packaging hygiene: `docs/` and the dev-only `scripts/` directory are excluded from the VSIX.
 
 ## 0.0.6
