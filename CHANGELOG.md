@@ -4,6 +4,43 @@ All notable changes to the AWS Bedrock Provider for GitHub Copilot Chat extensio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- **`Invalid JSON for tool call`, which stopped agent turns mid-task** (#25). This was several independent defects, not one:
+  - **Output-token ceiling defaulted to 4096.** Copilot does not send `max_tokens`, so every response was capped at 4096 output tokens no matter what the model allowed. A whole-file edit call exceeds that easily, Bedrock stops mid-string with `stopReason: max_tokens`, and the half-written JSON never parses. Requests now default to the model's own ceiling, and the per-model fallback is version-aware instead of a flat 4096.
+  - **Stream state was shared across concurrent requests.** One tool-argument buffer lived on the request handler and was reset at the start of every stream, so a second concurrent request wiped the arguments the first was still accumulating. That is what produced the reported error with an empty `snippet`. Buffers are now created per response.
+  - **Zero-parameter tool calls were treated as failures.** A tool whose schema declares no parameters emits no argument deltas at all; the empty buffer is now emitted as `{}`.
+  - **The same failure was logged twice.** Force-emitting is now terminal, so `contentBlockStop` followed by `messageStop` reports once.
+  - **Legitimate repeat tool calls were dropped.** Deduplication keyed on the arguments, so a model asking to read the same file twice in one turn lost the second call. It now keys on `toolUseId`.
+  - **Object-valued argument deltas became `[object Object]`.** Bedrock documents `delta.toolUse.input` as a string, but some model families return a parsed object; those are now serialized.
+  - **Failures were silent.** A dropped tool call now raises a visible error naming the tool, and says which setting to raise when the output cap was the cause. Truncated arguments are deliberately never repaired, because applying half of a file-edit call would corrupt the file.
+- **Text was discarded when it shared a message with tool results** (#25). Both are now sent.
+- **Mid-stream Bedrock faults ended turns quietly.** Bedrock reports throttling, validation and internal errors as stream *events* rather than throwing; those are now surfaced. Conversely, a single malformed event no longer abandons the rest of the response.
+- **Mismatched `tool_use` / `tool_result` pairs caused opaque 400s.** Orphan and duplicate tool results are dropped, and unanswered tool calls get a synthetic error result, so the model learns its tool did not run instead of the request failing with no detail.
+- **Cancelling a request left the HTTP connection open.** Cancellation is now bridged to the AWS SDK through an abort signal.
+- **Context-window display read near-empty during tool-heavy sessions** (#22). The token estimator counted only text parts; it now counts tool calls, tool results, images and binary content, with per-message overhead.
+
+### Added
+
+- **Token usage, context size and latency reporting** (#22). Bedrock returns all of it on the stream's `metadata` event, which the provider previously ignored. Each turn now logs input/output/total tokens, cache reads and writes, context-window percentage, latency, stop reason and tool-call count to the **Bedrock Chat** output channel, with running session totals, plus warnings when the context passes 90% full or when caching produced no activity. Note the ceiling on this: the finalized provider API gives a provider no channel for feeding usage into Copilot's own Agent debug log.
+- **Prompt caching** (#19), on by default and toggleable via `promptCaching.enabled`. Checkpoints are placed on tool schemas, the system prompt and the trailing pair of user messages, so each turn reads back the checkpoint the previous turn wrote. Capped at Anthropic's four, gated on a fail-closed model capability check, and skipped entirely below the minimum cacheable prompt size.
+- **Extended thinking**, off by default, with `thinking.enabled`, `thinking.effort` (`low`/`medium`/`high`/`xhigh`), `thinking.budgetTokens` and `thinking.display` (`native`/`text`/`hidden`). The right API is chosen per model: the adaptive effort API for Claude 4.6 and newer, the token-budget API for 3.7 through 4.5, and nothing for older models. Enabling it suppresses `temperature` and `topP` and relaxes a forced tool choice, as Anthropic requires. Signed reasoning is replayed verbatim on the follow-up tool-result turn, keyed by tool-use ID so concurrent requests cannot cross-contaminate. Native rendering is feature-detected at runtime rather than declared as a proposed API, since the Marketplace rejects builds that declare one.
+- **Native token counting** via Bedrock's `CountTokens` API, on by default and toggleable via `nativeTokenCounting`, replacing the character heuristic for the pre-flight context check. A model that permanently rejects the call is remembered, so it is not re-probed every turn; transient faults such as throttling are not held against it.
+- **`maxOutputTokens` setting** to cap output tokens per response. `0` means the model's maximum.
+- **Manual model declarations** (#23) for environments where model listing is blocked by a Service Control Policy but invocation is allowed.
+
+### Changed
+
+- Connection handling: longer streaming timeouts, keep-alive connection pooling shared per client kind, and the AWS SDK's adaptive retry mode. SDK-level retries were chosen over a hand-rolled retry around the stream, which can duplicate already-emitted output.
+- Cross-region routing prefixes `global.` and `apac.` are now stripped during capability detection. A `global.`-prefixed Claude 4 ID previously fell through to the default profile and sent `temperature`, which Bedrock rejects.
+- The per-message request dump in the output channel is now one summary line per direction. A long agent session sends over a hundred messages per turn, and the old dump buried everything worth reading.
+
+### Internal
+
+- 119 offline unit tests, up from 59, covering the tool-buffer fixes, stream results and error handling, cache-point placement, tool-block reconciliation, thinking configuration and display, usage tracking, token estimation across every part type, and per-model output ceilings. Every file touched is lint-clean.
+
 ## 0.0.6
 
 ### Fixed

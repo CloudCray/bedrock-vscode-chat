@@ -1,14 +1,57 @@
 import * as vscode from "vscode";
 import type { LanguageModelChatInformation } from "vscode";
-import type { BedrockModelSummary, AuthConfig, ManualModel } from "../types";
+import type { BedrockModelSummary, ManualModel } from "../types";
 import { BedrockClient } from "../clients/bedrock.client";
 import { OpenRouterClient } from "./openrouter.client";
 import { AuthenticationService } from "./authentication.service";
 import { ConfigurationService } from "./configuration.service";
+import { parseClaudeVersion } from "../profiles";
 import { logger } from "../logger";
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
 const DEFAULT_CONTEXT_LENGTH = 200000;
+
+/**
+ * Fallback output-token ceiling for a model, used only when neither a manual
+ * override nor OpenRouter supplies one.
+ *
+ * A flat 4096 used to be the fallback for every model, and because the request
+ * builder clamps to this number it silently capped modern Claude models at an
+ * eighth of what they allow. Any tool call larger than that was cut off
+ * mid-JSON, which is the failure users saw as "Invalid JSON for tool call".
+ *
+ * The values are deliberately at or below each family's documented maximum
+ * rather than at the highest figure available: Bedrock rejects the whole request
+ * when maxTokens exceeds what the model permits, so guessing high would break
+ * every call instead of only large ones. Users who want the true ceiling can set
+ * `maxOutputTokens` explicitly.
+ *
+ * Exported for unit testing.
+ */
+export function defaultMaxOutputTokens(modelId: string): number {
+	if (!/anthropic|claude/.test(modelId)) {
+		return DEFAULT_MAX_OUTPUT_TOKENS;
+	}
+
+	const version = parseClaudeVersion(modelId);
+	if (!version) {
+		// Unrecognized Claude naming: assume a current model but stay inside the
+		// most conservative modern ceiling.
+		return 32000;
+	}
+	if (version.major >= 4) {
+		return 32000;
+	}
+	if (version.major === 3) {
+		if (version.minor >= 7) {
+			return 32000;
+		}
+		if (version.minor >= 5) {
+			return 8192;
+		}
+	}
+	return DEFAULT_MAX_OUTPUT_TOKENS;
+}
 
 /**
  * The broad geographic inference-profile prefix for a source region
@@ -106,9 +149,7 @@ export class ModelService {
 	/**
 	 * Fetch and prepare language model chat information
 	 */
-	async getLanguageModelChatInformation(
-		silent: boolean = false
-	): Promise<LanguageModelChatInformation[]> {
+	async getLanguageModelChatInformation(silent = false): Promise<LanguageModelChatInformation[]> {
 		const authConfig = await this.authService.getAuthConfig(silent);
 		if (!authConfig) {
 			return [];
@@ -189,7 +230,8 @@ export class ModelService {
 			const manual = manualById.get(m.modelId);
 			const properties = await this.openRouterClient.getModelProperties(m.modelId);
 			const maxInput = manual?.maxInputTokens ?? properties?.contextLength ?? DEFAULT_CONTEXT_LENGTH;
-			const maxOutput = manual?.maxOutputTokens ?? properties?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+			const maxOutput =
+				manual?.maxOutputTokens ?? properties?.maxOutputTokens ?? defaultMaxOutputTokens(m.modelId);
 			const vision = m.inputModalities.includes("IMAGE");
 
 			const modelInfo: LanguageModelChatInformation = {
