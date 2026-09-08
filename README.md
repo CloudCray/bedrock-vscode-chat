@@ -177,23 +177,35 @@ Reasoning is signed by Bedrock and must be replayed verbatim on the follow-up tu
 
 Effort can be changed without opening settings, in two places:
 
-**The status bar**, bottom right, reads `Bedrock: think high` (or `think off`). Click it for a quick pick of `off` / `low` / `medium` / `high` / `xhigh`. It writes the same **Thinking: Enabled** and **Thinking: Effort** settings the settings editor shows, so the two can never disagree. This is a **global default** — it applies to every conversation. Hide the item as you would any other: right-click the status bar and untick *Bedrock Thinking Effort*.
+**The status bar**, bottom right, reads `Bedrock: think high` (or `think off`).
 
-**The chat model picker**, once **Thinking: Show Effort Variants In Model Picker** is on (the quick pick has a toggle for it at the bottom). Each reasoning-capable model then appears once plainly and once per level:
+![The status bar item](docs/screenshots/03-status-bar.png)
 
-```
-Claude Sonnet 4.6                 ← uses the status bar default
-Claude Sonnet 4.6 · think low
-Claude Sonnet 4.6 · think medium
-Claude Sonnet 4.6 · think high    ← overrides the default, for this chat only
-Claude Sonnet 4.6 · think xhigh
-```
+Click it for a quick pick of `off` / `low` / `medium` / `high` / `xhigh`, with the current level ticked:
 
-Because VS Code remembers the chosen model per conversation, picking a variant makes effort **per-conversation**: a `think xhigh` chat and a `think low` chat can run side by side. Models with no reasoning mode are never expanded.
+![The thinking effort quick pick](docs/screenshots/05-effort-quick-pick.png)
+
+It writes the same **Thinking: Enabled** and **Thinking: Effort** settings the settings editor shows, so the two can never disagree. This is a **global default** — it applies to every conversation. Hide the item as you would any other: right-click the status bar and untick *Bedrock Thinking Effort*.
+
+**The chat model picker**, once **Thinking: Show Effort Variants In Model Picker** is on — the last entry in that quick pick toggles it, so you never need to open settings. Each reasoning-capable model then appears once plainly and once per level:
+
+![Effort variants in the chat model picker](docs/screenshots/04-model-picker.png)
+
+Because VS Code remembers the chosen model per conversation, picking a variant makes effort **per-conversation**: a `think xhigh` chat and a `think low` chat can run side by side. The plain entry has no suffix and inherits the status bar default.
 
 Precedence is simply: **a variant picked in the chat window wins; anything else falls back to the status bar default**, which can itself be off. The output channel records which applied, as `thinkingEffort` and `thinkingSource` on each turn.
 
+Models with no reasoning mode are never expanded — padding the list with entries that would be ignored on the wire is worse than not offering them. Below, Claude 3 Haiku and DeepSeek V3.2 stay single rows while the Claude 4.5+ models each gain four:
+
+| Variants off (the default) | Variants on |
+| --- | --- |
+| ![Model list with variants off](docs/screenshots/01-language-models-variants-off.png) | ![Model list with variants on](docs/screenshots/02-language-models-variants-on.png) |
+
+#### Curating which variants you see
+
 The variants are off by default because they multiply the length of a list people already know. Turning them on or off refreshes the picker immediately — no reload needed, and with them off the behaviour is exactly the status bar plus settings.
+
+If you want the per-conversation control but not all four levels, you do not have to accept the full list. Variants are ordinary models, so VS Code's own per-model visibility toggles apply: open **Manage Language Models** (the gear in the model picker, or *Chat: Manage Language Models*) and use the eye icons to hide the levels you never reach for. The second screenshot above is doing exactly that — `low` and `medium` are hidden, so the picker offers only `high` and `xhigh`.
 
 [docs/mockups/](docs/mockups/) records the alternatives that were considered and why this combination won.
 
