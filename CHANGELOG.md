@@ -40,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Internal
 
 - 119 offline unit tests, up from 59, covering the tool-buffer fixes, stream results and error handling, cache-point placement, tool-block reconciliation, thinking configuration and display, usage tracking, token estimation across every part type, and per-model output ceilings. Every file touched is lint-clean.
+- `scripts/live-feature-test.js`, a live end-to-end harness that drives the compiled modules against real Bedrock and asserts on the responses: cache checkpoints reading back across turns, signed reasoning on both thinking APIs, a multi-kilobyte tool call arriving as parseable JSON, mid-stream fault propagation, and usage captured from the metadata event. Verified 19/19 against Claude Haiku 4.5 and Sonnet 4.6 in `us-west-2`.
 
 ## 0.0.6
 
