@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import type { AuthMethod, ManualModel } from "../types";
+import type { ThinkingEffort } from "../converters/request";
+import type { ThinkingDisplay } from "../thinking";
 
 /**
  * Centralized configuration management for Bedrock extension.
@@ -82,4 +84,72 @@ export class ConfigurationService {
 		const config = vscode.workspace.getConfiguration(this.configSection);
 		return config.get<ManualModel[]>('manualModels') ?? [];
 	}
+
+	/**
+	 * Whether extended thinking should be requested from models that support it.
+	 */
+	isThinkingEnabled(): boolean {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		return config.get<boolean>('thinking.enabled') ?? false;
+	}
+
+	/**
+	 * Reasoning effort for models on the adaptive thinking API, and the basis for
+	 * the token budget on older models.
+	 */
+	getThinkingEffort(): ThinkingEffort {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		const value = config.get<string>('thinking.effort') ?? 'medium';
+		return isThinkingEffort(value) ? value : 'medium';
+	}
+
+	/**
+	 * Explicit token budget for models on the legacy thinking API.
+	 * 0 means "derive it from the effort level".
+	 */
+	getThinkingBudgetTokens(): number {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		const value = config.get<number>('thinking.budgetTokens') ?? 0;
+		return value > 0 ? Math.max(1024, value) : 0;
+	}
+
+	/**
+	 * How reasoning output should be displayed.
+	 */
+	getThinkingDisplay(): ThinkingDisplay {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		const value = config.get<string>('thinking.display') ?? 'native';
+		return value === 'hidden' || value === 'native' || value === 'text' ? value : 'native';
+	}
+
+	/**
+	 * Whether to insert Bedrock prompt-cache checkpoints into requests.
+	 */
+	isPromptCachingEnabled(): boolean {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		return config.get<boolean>('promptCaching.enabled') ?? true;
+	}
+
+	/**
+	 * User cap on output tokens per response. 0 means "use the model's maximum",
+	 * which is the default: a low cap truncates large tool calls mid-JSON.
+	 */
+	getMaxOutputTokens(): number {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		const value = config.get<number>('maxOutputTokens') ?? 0;
+		return value > 0 ? value : 0;
+	}
+
+	/**
+	 * Whether to ask Bedrock to count input tokens before sending. Accurate but
+	 * costs an extra API round trip per turn.
+	 */
+	isNativeTokenCountingEnabled(): boolean {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		return config.get<boolean>('nativeTokenCounting') ?? true;
+	}
+}
+
+function isThinkingEffort(value: string): value is ThinkingEffort {
+	return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh';
 }
