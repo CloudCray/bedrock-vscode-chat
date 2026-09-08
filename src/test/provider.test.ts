@@ -22,7 +22,14 @@ import {
 	regionGeoPrefix,
 	manualModelToSummary,
 	defaultMaxOutputTokens,
+	expandEffortVariants,
 } from "../services/model.service";
+import {
+	THINKING_EFFORTS,
+	decodeVariantId,
+	encodeVariantId,
+	resolveThinkingForTurn,
+} from "../thinking-variants";
 import type { BedrockMessage, BedrockSystemBlock, BedrockToolResultBlock } from "../types";
 
 /** Shape of the provider-specific fields the request builder attaches. */
@@ -413,6 +420,15 @@ suite("Bedrock Chat Provider Extension", () => {
 			assert.equal(anthropicThinkingApi("anthropic.claude-sonnet-5"), "adaptive");
 			assert.equal(anthropicThinkingApi("anthropic.claude-sonnet-10-20270101-v1:0"), "adaptive");
 			assert.equal(anthropicThinkingApi("anthropic.claude-future-model"), "adaptive");
+		});
+
+		test("the pre-3 naming schemes get no thinking API", () => {
+			// These carry no parseable version, so "assume current" would otherwise
+			// send a reasoning config to a model that predates the feature.
+			assert.equal(anthropicThinkingApi("anthropic.claude-v2"), "none");
+			assert.equal(anthropicThinkingApi("anthropic.claude-v2:1"), "none");
+			assert.equal(anthropicThinkingApi("anthropic.claude-instant-v1"), "none");
+			assert.equal(getModelProfile("anthropic.claude-v2").thinkingApi, "none");
 		});
 	});
 
@@ -1679,4 +1695,113 @@ suite("Bedrock Chat Provider Extension", () => {
 			assert.equal((texts[1] as vscode.LanguageModelTextPart).value, " ");
 		});
 	});
+
+	suite("thinking effort variants", () => {
+		const SONNET = "us.anthropic.claude-sonnet-4-6-20250929-v1:0";
+
+		test("round-trips an effort level through the model ID", () => {
+			for (const effort of THINKING_EFFORTS) {
+				const id = encodeVariantId(SONNET, effort);
+				assert.deepEqual(decodeVariantId(id), { baseId: SONNET, effort });
+			}
+		});
+
+		test("leaves a plain model ID untouched", () => {
+			assert.deepEqual(decodeVariantId(SONNET), { baseId: SONNET });
+		});
+
+		test("an inference profile ARN survives decoding unchanged", () => {
+			// ARNs contain colons and slashes; the separator must not collide.
+			const arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123";
+			assert.deepEqual(decodeVariantId(arn), { baseId: arn });
+			assert.deepEqual(decodeVariantId(encodeVariantId(arn, "high")), { baseId: arn, effort: "high" });
+		});
+
+		test("an unrecognized suffix degrades to the base model, not an error", () => {
+			// A conversation persisted by a newer build must still be invocable.
+			assert.deepEqual(decodeVariantId(`${SONNET}#think=extreme`), { baseId: SONNET });
+			assert.deepEqual(decodeVariantId(`${SONNET}#think=`), { baseId: SONNET });
+		});
+
+		test("a separator with nothing before it is not treated as a variant", () => {
+			assert.deepEqual(decodeVariantId("#think=high"), { baseId: "#think=high" });
+		});
+
+		test("a picked variant overrides the global default", () => {
+			const resolved = resolveThinkingForTurn("xhigh", { enabled: false, effort: "low" });
+			assert.deepEqual(resolved, { enabled: true, effort: "xhigh", source: "model-picker" });
+		});
+
+		test("a plain model inherits the global default, including off", () => {
+			assert.deepEqual(resolveThinkingForTurn(undefined, { enabled: true, effort: "high" }), {
+				enabled: true,
+				effort: "high",
+				source: "default",
+			});
+			assert.deepEqual(resolveThinkingForTurn(undefined, { enabled: false, effort: "high" }), {
+				enabled: false,
+				effort: "high",
+				source: "default",
+			});
+		});
+
+		test("expansion adds one entry per effort level for a reasoning model", () => {
+			const variants = expandEffortVariants(modelInfo(SONNET, "Claude Sonnet 4.6"));
+
+			assert.equal(variants.length, 1 + THINKING_EFFORTS.length);
+			assert.equal(variants[0].id, SONNET, "the plain entry comes first and keeps the bare ID");
+			assert.deepEqual(
+				variants.slice(1).map((v) => decodeVariantId(v.id).effort),
+				[...THINKING_EFFORTS]
+			);
+			// Every row must be distinguishable by name alone: `detail` is not
+			// rendered in all the places VS Code shows a model.
+			assert.equal(new Set(variants.map((v) => v.name)).size, variants.length);
+			for (const v of variants.slice(1)) {
+				assert.ok(v.name.startsWith("Claude Sonnet 4.6 · think "), `unexpected name: ${v.name}`);
+			}
+		});
+
+		test("expansion carries capabilities and limits through unchanged", () => {
+			const base = modelInfo(SONNET, "Claude Sonnet 4.6");
+			for (const v of expandEffortVariants(base)) {
+				assert.equal(v.maxInputTokens, base.maxInputTokens);
+				assert.equal(v.maxOutputTokens, base.maxOutputTokens);
+				assert.deepEqual(v.capabilities, base.capabilities);
+				assert.equal(v.family, base.family);
+			}
+		});
+
+		test("a model with no reasoning mode gets no variants", () => {
+			for (const id of ["amazon.nova-pro-v1:0", "meta.llama3-2-11b-instruct-v1:0", "anthropic.claude-v2"]) {
+				const expanded = expandEffortVariants(modelInfo(id, id));
+				assert.equal(expanded.length, 1, `${id} should not be expanded`);
+				assert.equal(expanded[0].id, id);
+			}
+		});
+
+		test("a variant ID resolves to the same model profile as its base", () => {
+			// Guards the decode step in the request handler: were it skipped, the
+			// profile lookup would still have to be right, and this asserts what the
+			// handler relies on.
+			const base = getModelProfile(SONNET);
+			const viaVariant = getModelProfile(decodeVariantId(encodeVariantId(SONNET, "high")).baseId);
+			assert.deepEqual(viaVariant, base);
+		});
+	});
 });
+
+/** Minimal LanguageModelChatInformation for the variant-expansion tests. */
+function modelInfo(id: string, name: string): vscode.LanguageModelChatInformation {
+	return {
+		id,
+		name,
+		tooltip: "AWS Bedrock - Anthropic",
+		detail: "Anthropic • us-east-1",
+		family: "bedrock",
+		version: "1.0.0",
+		maxInputTokens: 200000,
+		maxOutputTokens: 32000,
+		capabilities: { toolCalling: true, imageInput: true },
+	};
+}

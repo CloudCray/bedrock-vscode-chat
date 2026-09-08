@@ -77,6 +77,10 @@ const { StreamProcessor } = require(path.join(OUT, "stream-processor.js"));
 const { UsageTracker } = require(path.join(OUT, "usage-tracker.js"));
 const { getThinkingPartCtor, resetThinkingPartCache, createThinkingReporter } = require(path.join(OUT, "thinking.js"));
 const { BedrockClient } = require(path.join(OUT, "clients/bedrock.client.js"));
+const {
+	THINKING_EFFORTS, encodeVariantId, decodeVariantId, resolveThinkingForTurn,
+} = require(path.join(OUT, "thinking-variants.js"));
+const { expandEffortVariants } = require(path.join(OUT, "services/model.service.js"));
 
 const {
 	BedrockRuntimeClient, ConverseStreamCommand,
@@ -292,6 +296,72 @@ await test("forced tool choice relaxed to auto when thinking is on", async () =>
 	});
 	assert.deepStrictEqual(b.input.toolConfig.toolChoice, { auto: {} });
 	return "tool choice → auto";
+});
+
+await test("effort variants: picker rows decode back to a real, invocable model ID", async () => {
+	const rows = expandEffortVariants({
+		id: ADAPTIVE, name: "Claude Sonnet 4.6", detail: "Anthropic • Multi-Region",
+		tooltip: "AWS Bedrock - Anthropic", family: "bedrock", version: "1.0.0",
+		maxInputTokens: 200000, maxOutputTokens: 64000,
+		capabilities: { toolCalling: true, imageInput: true },
+	});
+	assert.strictEqual(rows.length, 1 + THINKING_EFFORTS.length);
+	assert.strictEqual(rows[0].id, ADAPTIVE, "the plain row keeps the bare ID");
+
+	// The wire ID and the capability profile must both come out of the decode, or
+	// Bedrock is handed a model ID it has never heard of.
+	for (const row of rows.slice(1)) {
+		const { baseId, effort } = decodeVariantId(row.id);
+		assert.strictEqual(baseId, ADAPTIVE);
+		assert.ok(THINKING_EFFORTS.includes(effort));
+		assert.deepStrictEqual(getModelProfile(baseId), getModelProfile(ADAPTIVE));
+
+		const built = buildRequestInput({
+			model: model(baseId, 64000), converted: { messages: [userMsg("hi")], system: [] },
+			options: {}, profile: getModelProfile(baseId),
+			thinking: { enabled: true, effort, budgetTokens: 0 },
+		});
+		assert.strictEqual(built.input.modelId, ADAPTIVE, "no variant suffix may reach the wire");
+		assert.deepStrictEqual(built.input.additionalModelRequestFields.output_config, { effort });
+	}
+
+	// A model with no reasoning mode must not be padded out with dead rows.
+	const nova = expandEffortVariants({ id: "amazon.nova-pro-v1:0", name: "Nova Pro" });
+	assert.strictEqual(nova.length, 1);
+
+	return `${rows.length} rows for Sonnet 4.6, 1 for Nova Pro`;
+});
+
+await test("effort precedence: a picked variant beats the status bar default", async () => {
+	// The variant wins even when the global default is off entirely.
+	assert.deepStrictEqual(resolveThinkingForTurn("xhigh", { enabled: false, effort: "low" }),
+		{ enabled: true, effort: "xhigh", source: "model-picker" });
+	// A plain row inherits, off included.
+	assert.deepStrictEqual(resolveThinkingForTurn(undefined, { enabled: false, effort: "high" }),
+		{ enabled: false, effort: "high", source: "default" });
+	assert.deepStrictEqual(resolveThinkingForTurn(undefined, { enabled: true, effort: "high" }),
+		{ enabled: true, effort: "high", source: "default" });
+	// A stale or hand-typed suffix must degrade, not fail the request.
+	assert.deepStrictEqual(decodeVariantId(`${ADAPTIVE}#think=extreme`), { baseId: ADAPTIVE });
+	return "variant > default; unknown suffix degrades to base";
+});
+
+await test("effort variants LIVE: a variant-derived effort is accepted by Bedrock", async () => {
+	// End-to-end proof that the ID the picker hands back produces a request
+	// Bedrock will actually run — the failure mode being a variant suffix leaking
+	// onto the wire as an unknown model ID.
+	const pickerId = encodeVariantId(ADAPTIVE, "low");
+	const { baseId, effort } = decodeVariantId(pickerId);
+	const built = buildRequestInput({
+		model: model(baseId, 4096),
+		converted: { messages: [userMsg("What is 19 * 23? Answer with the number only.")], system: [] },
+		options: {}, profile: getModelProfile(baseId),
+		thinking: { enabled: true, effort, budgetTokens: 0 },
+	});
+	const { result, progress } = await run(built.input, { thinkingDisplay: "hidden" });
+	assert.notStrictEqual(result.stopReason, undefined, "the request must complete, not fault");
+	assert.ok(progress.text().includes("437"), `expected 437 in: ${progress.text()}`);
+	return `effort=${effort} accepted; stop=${result.stopReason}, reasoning blocks=${result.reasoning.length}`;
 });
 
 await test(`native thinking display — ${INSIDERS ? "API present (Insiders)" : "API absent (stable)"}`, async () => {

@@ -114,6 +114,35 @@ export class ConfigurationService {
 	}
 
 	/**
+	 * Whether to expose each effort level as its own entry in the chat model
+	 * picker, so effort can be chosen per conversation.
+	 *
+	 * Off by default: it multiplies every reasoning-capable model by the number of
+	 * effort levels, which is a big change to a list people already know.
+	 */
+	showEffortVariants(): boolean {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		return config.get<boolean>('thinking.showEffortVariants') ?? false;
+	}
+
+	/**
+	 * Persist the global thinking default. Written at global scope because the
+	 * status bar item that drives it is not workspace-specific.
+	 */
+	async setThinkingDefault(enabled: boolean, effort?: ThinkingEffort): Promise<void> {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		await config.update('thinking.enabled', enabled, vscode.ConfigurationTarget.Global);
+		if (effort) {
+			await config.update('thinking.effort', effort, vscode.ConfigurationTarget.Global);
+		}
+	}
+
+	async setShowEffortVariants(show: boolean): Promise<void> {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		await config.update('thinking.showEffortVariants', show, vscode.ConfigurationTarget.Global);
+	}
+
+	/**
 	 * How reasoning output should be displayed.
 	 */
 	getThinkingDisplay(): ThinkingDisplay {

@@ -169,6 +169,12 @@
 						],
 						"markdownDescription": "How much reasoning to request. Newer models take this directly and choose their own token budget; older ones convert it into a budget, which `#languageModelChatProvider.bedrock.thinking.budgetTokens#` can override."
 					},
+					"languageModelChatProvider.bedrock.thinking.showEffortVariants": {
+						"type": "boolean",
+						"title": "Show Effort Variants In Model Picker",
+						"default": false,
+						"markdownDescription": "List each reasoning model once per effort level in the chat model picker, as `Claude Sonnet 4.6 · think high`. Picking one of these sets the effort for that conversation only, overriding `#languageModelChatProvider.bedrock.thinking.effort#`. Off by default because it multiplies the number of entries in the picker. The status bar item still sets the default used by the plain entries."
+					},
 					"languageModelChatProvider.bedrock.thinking.budgetTokens": {
 						"type": "number",
 						"title": "Thinking Budget Tokens",
@@ -220,6 +226,11 @@
 			{
 				"command": "bedrock.configure",
 				"title": "Configure AWS Bedrock",
+				"category": "AWS Bedrock"
+			},
+			{
+				"command": "bedrock.selectThinkingEffort",
+				"title": "Select Thinking Effort",
 				"category": "AWS Bedrock"
 			}
 		]
