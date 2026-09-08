@@ -5,7 +5,8 @@ import { BedrockClient } from "../clients/bedrock.client";
 import { OpenRouterClient } from "./openrouter.client";
 import { AuthenticationService } from "./authentication.service";
 import { ConfigurationService } from "./configuration.service";
-import { parseClaudeVersion } from "../profiles";
+import { getModelProfile, parseClaudeVersion } from "../profiles";
+import { THINKING_EFFORTS, encodeVariantId } from "../thinking-variants";
 import { logger } from "../logger";
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
@@ -114,6 +115,43 @@ export function manualModelToSummary(mm: ManualModel): BedrockModelSummary {
 }
 
 /**
+ * Expand one model into itself plus one entry per reasoning effort level.
+ *
+ * The chat window offers no place for a provider to add its own controls, so the
+ * model picker is the only way to make effort a per-conversation choice. Models
+ * with no reasoning mode are returned unchanged — padding the list with variants
+ * that would be ignored on the wire is worse than not offering them.
+ *
+ * The effort appears in `name` as well as `detail` on purpose. `detail` is not
+ * rendered in every surface that shows a model (the compact button under the
+ * chat input, for one), and five rows reading `Claude Sonnet 4.6` with no
+ * visible difference would be unusable.
+ *
+ * Pure (no I/O) so the expansion is unit-testable.
+ */
+export function expandEffortVariants(info: LanguageModelChatInformation): LanguageModelChatInformation[] {
+	if (getModelProfile(info.id).thinkingApi === "none") {
+		return [info];
+	}
+
+	const base: LanguageModelChatInformation = {
+		...info,
+		tooltip: `${info.tooltip ?? "AWS Bedrock"} • reasoning effort follows the Bedrock status bar`,
+	};
+
+	return [
+		base,
+		...THINKING_EFFORTS.map((effort) => ({
+			...info,
+			id: encodeVariantId(info.id, effort),
+			name: `${info.name} · think ${effort}`,
+			detail: `${info.detail ?? ""} • think: ${effort}`.replace(/^ • /, ""),
+			tooltip: `${info.tooltip ?? "AWS Bedrock"} • reasoning effort ${effort}, overriding the default`,
+		})),
+	];
+}
+
+/**
  * Manages model information, capabilities, and metadata.
  * Coordinates between AWS Bedrock and OpenRouter data sources.
  */
@@ -212,6 +250,8 @@ export class ModelService {
 		}
 		this.invocationTargets.clear();
 
+		const showVariants = this.configService.showEffortVariants();
+
 		for (const m of models) {
 			if (!m.responseStreamingSupported || !m.outputModalities.includes("TEXT")) {
 				continue;
@@ -248,7 +288,11 @@ export class ModelService {
 					imageInput: vision,
 				},
 			};
-			infos.push(modelInfo);
+			if (showVariants) {
+				infos.push(...expandEffortVariants(modelInfo));
+			} else {
+				infos.push(modelInfo);
+			}
 		}
 
 		this.chatEndpoints = infos.map((info) => ({

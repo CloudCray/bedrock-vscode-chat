@@ -53,7 +53,7 @@ Select "default" in Settings → Language Model Chat Provider: Bedrock → Auth 
 - Vision/image input for compatible models (Claude, Amazon Nova, Pixtral) — see [Limitations](#limitations)
 - Support across AWS regions
 - Cross-region inference profiles for optimized model access and routing
-- [Extended thinking](#extended-thinking-reasoning) with a configurable effort level or token budget
+- [Extended thinking](#extended-thinking-reasoning) with a configurable effort level or token budget, settable [from the status bar or per conversation](#choosing-an-effort-level)
 - [Prompt caching](#prompt-caching) to cut the cost and latency of long sessions
 - [Token usage and context-size reporting](#token-usage-and-context-size) in the output channel
 
@@ -88,7 +88,8 @@ Configure the extension through VS Code settings (Cmd/Ctrl + , then search for "
 - **Max Output Tokens**: Cap on output tokens per response. `0` (the default) uses the model's own maximum. Only lower this if you want shorter answers — a low cap truncates large tool calls mid-JSON. See [Truncated tool calls](#truncated-tool-calls).
 - **Prompt Caching: Enabled**: Insert Bedrock prompt-cache checkpoints into requests. Default `true`. See [Prompt caching](#prompt-caching).
 - **Thinking: Enabled**: Request extended thinking from models that support it. Default `false`.
-- **Thinking: Effort**: `low`, `medium` (default), `high`, or `xhigh`.
+- **Thinking: Effort**: `low`, `medium` (default), `high`, or `xhigh`. This is the global default; see [Choosing an effort level](#choosing-an-effort-level).
+- **Thinking: Show Effort Variants In Model Picker**: List each reasoning model once per effort level in the chat model picker, so effort can be set per conversation. Default `false`.
 - **Thinking: Budget Tokens**: Explicit reasoning budget for models on the older budget-based API. `0` (the default) derives it from the effort level.
 - **Thinking: Display**: `native` (default), `text`, or `hidden`. See [Extended thinking](#extended-thinking-reasoning).
 - **Native Token Counting**: Ask Bedrock to count input tokens before sending, instead of estimating from character counts. Default `true`. Accurate, but costs one extra API round trip per turn.
@@ -172,6 +173,30 @@ The `native` option depends on a VS Code API that is still proposed, and a Marke
 
 Reasoning is signed by Bedrock and must be replayed verbatim on the follow-up turn that carries tool results, so the extension stores each turn's reasoning against the tool calls it produced and sends it back when those results arrive.
 
+#### Choosing an effort level
+
+Effort can be changed without opening settings, in two places:
+
+**The status bar**, bottom right, reads `Bedrock: think high` (or `think off`). Click it for a quick pick of `off` / `low` / `medium` / `high` / `xhigh`. It writes the same **Thinking: Enabled** and **Thinking: Effort** settings the settings editor shows, so the two can never disagree. This is a **global default** — it applies to every conversation. Hide the item as you would any other: right-click the status bar and untick *Bedrock Thinking Effort*.
+
+**The chat model picker**, once **Thinking: Show Effort Variants In Model Picker** is on (the quick pick has a toggle for it at the bottom). Each reasoning-capable model then appears once plainly and once per level:
+
+```
+Claude Sonnet 4.6                 ← uses the status bar default
+Claude Sonnet 4.6 · think low
+Claude Sonnet 4.6 · think medium
+Claude Sonnet 4.6 · think high    ← overrides the default, for this chat only
+Claude Sonnet 4.6 · think xhigh
+```
+
+Because VS Code remembers the chosen model per conversation, picking a variant makes effort **per-conversation**: a `think xhigh` chat and a `think low` chat can run side by side. Models with no reasoning mode are never expanded.
+
+Precedence is simply: **a variant picked in the chat window wins; anything else falls back to the status bar default**, which can itself be off. The output channel records which applied, as `thinkingEffort` and `thinkingSource` on each turn.
+
+The variants are off by default because they multiply the length of a list people already know. Turning them on or off refreshes the picker immediately — no reload needed, and with them off the behaviour is exactly the status bar plus settings.
+
+[docs/mockups/](docs/mockups/) records the alternatives that were considered and why this combination won.
+
 ### Prompt caching
 
 [Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html) lets you pay a reduced rate for the parts of a request the model has already seen. It is on by default for models that support it, and does nothing for models that do not.
@@ -203,6 +228,7 @@ Copilot's own context-window indicator is driven by the provider's token-count c
 ### Commands
 
 - **Configure AWS Bedrock**: Quick access to Bedrock settings
+- **AWS Bedrock: Select Thinking Effort**: The status bar quick pick, also reachable from the command palette
 - **Change Bedrock Model**: Information about model selection
 - **Manage AWS Bedrock Provider**: Legacy configuration command (deprecated)
 
@@ -247,8 +273,9 @@ node scripts/live-feature-test.js
 It loads the extension's own compiled modules and drives them end to end, asserting
 on Bedrock's actual responses: cache checkpoints reading back across turns, signed
 reasoning on both the adaptive and budget thinking APIs, a multi-kilobyte tool call
-arriving as parseable JSON, and usage/latency captured from the metadata event. It
-prints the tokens it spent. Roughly 7 API calls per run.
+arriving as parseable JSON, an effort variant chosen in the model picker decoding
+back to an invocable model ID, and usage/latency captured from the metadata event.
+It prints the tokens it spent. Roughly 8 API calls per run.
 
 `ONLY=<substring>` restricts it to matching tests. `EXT_DIR=<path>` points it at an
 installed extension directory instead of the repo build, to verify the artifact VS Code

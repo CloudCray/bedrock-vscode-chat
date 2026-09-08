@@ -14,6 +14,7 @@ import { convertMessages } from "../converters/messages";
 import { convertTools } from "../converters/tools";
 import { buildRequestInput } from "../converters/request";
 import { getModelProfile } from "../profiles";
+import { decodeVariantId, resolveThinkingForTurn } from "../thinking-variants";
 import { validateRequest } from "../validation";
 import { logger } from "../logger";
 import { ModelService } from "../services/model.service";
@@ -115,11 +116,21 @@ export class ChatRequestHandler {
 				parts: tallyParts(messages),
 			});
 
-			const profile = getModelProfile(model.id);
-			const thinkingRequested = this.configService.isThinkingEnabled();
+			// The picker ID may carry an effort level appended by the model-variant
+			// expansion. Everything downstream — capability detection, the wire
+			// modelId, invocation-target lookup — needs the real Bedrock ID.
+			const variant = decodeVariantId(model.id);
+			const modelId = variant.baseId;
+
+			const profile = getModelProfile(modelId);
+			const thinking = resolveThinkingForTurn(variant.effort, {
+				enabled: this.configService.isThinkingEnabled(),
+				effort: this.configService.getThinkingEffort(),
+			});
+			const thinkingRequested = thinking.enabled;
 			const thinkingPossible = thinkingRequested && profile.thinkingApi !== "none";
 
-			const converted = convertMessages(messages, model.id, {
+			const converted = convertMessages(messages, modelId, {
 				// Only replay reasoning when it will actually be needed. Sending it to
 				// a request that has thinking off is a validation error.
 				reasoningByToolUseId: thinkingPossible ? this.reasoningByToolUseId : undefined,
@@ -132,14 +143,14 @@ export class ChatRequestHandler {
 				blocks: tallyBlocks(converted.messages),
 			});
 
-			const toolConfig = convertTools(options, model.id);
+			const toolConfig = convertTools(options, modelId);
 
 			if (options.tools && options.tools.length > 128) {
 				throw new Error("Cannot have more than 128 tools per request.");
 			}
 
 			const built = buildRequestInput({
-				model,
+				model: { id: modelId, maxOutputTokens: model.maxOutputTokens },
 				converted,
 				options,
 				profile,
@@ -147,7 +158,7 @@ export class ChatRequestHandler {
 				maxOutputTokensOverride: this.configService.getMaxOutputTokens(),
 				thinking: {
 					enabled: thinkingRequested,
-					effort: this.configService.getThinkingEffort(),
+					effort: thinking.effort,
 					budgetTokens: this.configService.getThinkingBudgetTokens(),
 				},
 				promptCaching: this.configService.isPromptCachingEnabled(),
@@ -157,7 +168,7 @@ export class ChatRequestHandler {
 			// Substitute invocation target (override ARN or system profile) at the wire level.
 			// This keeps the bare model ID for getModelProfile() so capability detection
 			// (e.g. temperature suppression for Claude 4+) still works correctly.
-			const invocationTarget = this.modelService.getInvocationTarget(model.id);
+			const invocationTarget = this.modelService.getInvocationTarget(modelId);
 			if (invocationTarget) {
 				requestInput.modelId = invocationTarget;
 			}
@@ -167,7 +178,7 @@ export class ChatRequestHandler {
 			const tokenLimit = Math.max(1, model.maxInputTokens);
 			const { inputTokens, source } = await this.countInputTokens({
 				credentials,
-				modelId: requestInput.modelId ?? model.id,
+				modelId: requestInput.modelId ?? modelId,
 				requestInput,
 				messages,
 				converted,
@@ -190,6 +201,8 @@ export class ChatRequestHandler {
 				modelId: requestInput.modelId,
 				maxTokens: requestInput.inferenceConfig?.maxTokens,
 				thinking: built.thinkingEnabled,
+				thinkingEffort: built.thinkingEnabled ? thinking.effort : undefined,
+				thinkingSource: built.thinkingEnabled ? thinking.source : undefined,
 				cachePoints: built.cachePoints,
 				inputTokens,
 				tokenSource: source,
@@ -208,7 +221,7 @@ export class ChatRequestHandler {
 			logger.log("[Chat Request Handler] Finished processing stream");
 
 			this.usageTracker.record({
-				modelId: model.id,
+				modelId,
 				stopReason: result.stopReason,
 				usage: result.usage,
 				latencyMs: result.latencyMs,

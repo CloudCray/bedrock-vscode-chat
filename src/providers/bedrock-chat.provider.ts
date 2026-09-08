@@ -23,6 +23,15 @@ export class BedrockChatProvider implements LanguageModelChatProvider {
 	private chatRequestHandler: ChatRequestHandler;
 	private tokenEstimator: TokenEstimator;
 
+	private readonly modelsChanged = new vscode.EventEmitter<void>();
+
+	/**
+	 * Tells VS Code the model list is stale and must be re-queried. Without it,
+	 * turning the effort variants on or off would not change the picker until the
+	 * window was reloaded.
+	 */
+	readonly onDidChangeLanguageModelChatInformation = this.modelsChanged.event;
+
 	constructor(
 		private readonly configService: ConfigurationService,
 		private readonly authService: AuthenticationService
@@ -33,11 +42,24 @@ export class BedrockChatProvider implements LanguageModelChatProvider {
 	}
 
 	/**
-	 * Handle configuration changes
+	 * Handle configuration changes.
+	 *
+	 * `modelListChanged` is passed in rather than inferred, because firing the
+	 * refresh event re-runs model discovery: two Bedrock list calls plus an
+	 * OpenRouter lookup per model. Changing the effort default from the status bar
+	 * must not pay for that, so only settings that genuinely alter the list ask
+	 * for a refresh.
 	 */
-	handleConfigurationChange(): void {
+	handleConfigurationChange(modelListChanged = false): void {
 		this.modelService.handleConfigurationChange();
 		this.chatRequestHandler.handleConfigurationChange();
+		if (modelListChanged) {
+			this.modelsChanged.fire();
+		}
+	}
+
+	dispose(): void {
+		this.modelsChanged.dispose();
 	}
 
 	/**

@@ -3,7 +3,21 @@ import { BedrockChatProvider } from "./providers/bedrock-chat.provider";
 import { ConfigurationService } from "./services/configuration.service";
 import { AuthenticationService } from "./services/authentication.service";
 import { manageSettings } from "./commands/manage-settings";
+import { SELECT_THINKING_EFFORT_COMMAND, selectThinkingEffort } from "./commands/select-thinking-effort";
+import { ThinkingStatusBar } from "./status-bar";
 import { logger } from "./logger";
+
+/**
+ * Settings that change which models the picker should show. Only these warrant
+ * firing the provider's refresh event, since doing so re-runs model discovery.
+ */
+const MODEL_LIST_SETTINGS = [
+	"region",
+	"authMethod",
+	"manualModels",
+	"inferenceProfileOverrides",
+	"thinking.showEffortVariants",
+];
 
 export function activate(context: vscode.ExtensionContext) {
 	const outputChannel = vscode.window.createOutputChannel("Bedrock Chat");
@@ -17,17 +31,32 @@ export function activate(context: vscode.ExtensionContext) {
 	const provider = new BedrockChatProvider(configService, authService);
 
 	vscode.lm.registerLanguageModelChatProvider("bedrock", provider);
+	context.subscriptions.push(provider);
+
+	const statusBar = new ThinkingStatusBar(configService);
+	context.subscriptions.push(statusBar);
 
 	// Listen for configuration changes
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeConfiguration((e) => {
-			if (e.affectsConfiguration('languageModelChatProvider.bedrock')) {
-				provider.handleConfigurationChange();
+			if (!e.affectsConfiguration('languageModelChatProvider.bedrock')) {
+				return;
 			}
+			const modelListChanged = MODEL_LIST_SETTINGS.some((key) =>
+				e.affectsConfiguration(`languageModelChatProvider.bedrock.${key}`)
+			);
+			provider.handleConfigurationChange(modelListChanged);
+			statusBar.refresh();
 		})
 	);
 
 	// Register commands
+	context.subscriptions.push(
+		vscode.commands.registerCommand(SELECT_THINKING_EFFORT_COMMAND, async () => {
+			await selectThinkingEffort(configService);
+		})
+	);
+
 	context.subscriptions.push(
 		vscode.commands.registerCommand("bedrock.manage", async () => {
 			await manageSettings(context.secrets, context.globalState);

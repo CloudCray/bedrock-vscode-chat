@@ -79,6 +79,14 @@ export function parseClaudeVersion(modelId: string): { major: number; minor: num
  * than pattern-matched against a fixed list so future releases are covered.
  */
 export function anthropicThinkingApi(modelId: string): ThinkingApi {
+	// The pre-3 naming schemes carry no version to parse, and both predate
+	// extended thinking by years. Recognizing them costs nothing in future-proofing
+	// — the names are closed-ended and will not be reused — and it stops a
+	// reasoning config being sent to a model that would reject the whole request.
+	if (/claude-v2|claude-instant/.test(modelId)) {
+		return "none";
+	}
+
 	const version = parseClaudeVersion(modelId);
 
 	// Unknown version: assume a current model, which means the adaptive API.
