@@ -233,6 +233,32 @@ npm run compile
 
 Press F5 to launch an Extension Development Host.
 
+### Live feature test
+
+`npm test` is fully offline. To verify the streaming, caching, thinking and usage
+features against real Bedrock, run:
+
+```bash
+export AWS_BEARER_TOKEN_BEDROCK=...   # or AWS_PROFILE
+export AWS_REGION=us-west-2
+node scripts/live-feature-test.js
+```
+
+It loads the extension's own compiled modules and drives them end to end, asserting
+on Bedrock's actual responses: cache checkpoints reading back across turns, signed
+reasoning on both the adaptive and budget thinking APIs, a multi-kilobyte tool call
+arriving as parseable JSON, and usage/latency captured from the metadata event. It
+prints the tokens it spent. Roughly 7 API calls per run.
+
+`ONLY=<substring>` restricts it to matching tests. `EXT_DIR=<path>` points it at an
+installed extension directory instead of the repo build, to verify the artifact VS Code
+actually loaded. `STUB_THINKING_API=1` simulates the Insiders-only thinking API.
+
+Two behaviors are environment-dependent rather than defects: `bedrock:CountTokens`
+requires that IAM action (the extension falls back to estimation and remembers the
+rejection), and a cache checkpoint reports a read instead of a write when a prior run
+already populated it.
+
 ## Troubleshooting
 
 ### Truncated tool calls
