@@ -24,6 +24,7 @@ export class BedrockChatProvider implements LanguageModelChatProvider {
 	private tokenEstimator: TokenEstimator;
 
 	private readonly modelsChanged = new vscode.EventEmitter<void>();
+	private readonly discoveryCompleted = new vscode.EventEmitter<void>();
 
 	/**
 	 * Tells VS Code the model list is stale and must be re-queried. Without it,
@@ -32,6 +33,16 @@ export class BedrockChatProvider implements LanguageModelChatProvider {
 	 */
 	readonly onDidChangeLanguageModelChatInformation = this.modelsChanged.event;
 
+	/**
+	 * Fires after model discovery resolves, so UI that depends on the discovered
+	 * output ceilings can update.
+	 *
+	 * Separate from `onDidChangeLanguageModelChatInformation`, which is consumed by
+	 * VS Code and re-triggers discovery — subscribing to that to learn discovery
+	 * had finished would loop.
+	 */
+	readonly onDidCompleteDiscovery = this.discoveryCompleted.event;
+
 	constructor(
 		private readonly configService: ConfigurationService,
 		private readonly authService: AuthenticationService
@@ -39,6 +50,18 @@ export class BedrockChatProvider implements LanguageModelChatProvider {
 		this.modelService = new ModelService(authService, configService);
 		this.chatRequestHandler = new ChatRequestHandler(this.modelService, authService, configService);
 		this.tokenEstimator = new TokenEstimator();
+	}
+
+	/**
+	 * The model service, for commands that need the discovered ceilings.
+	 *
+	 * Exposed rather than constructing a second ModelService in each command:
+	 * discovery is two Bedrock list calls plus an OpenRouter lookup per model, and
+	 * a separate instance would show ceilings that need not match the ones the
+	 * request path is actually using.
+	 */
+	get models(): ModelService {
+		return this.modelService;
 	}
 
 	/**
@@ -60,6 +83,7 @@ export class BedrockChatProvider implements LanguageModelChatProvider {
 
 	dispose(): void {
 		this.modelsChanged.dispose();
+		this.discoveryCompleted.dispose();
 	}
 
 	/**
@@ -79,7 +103,11 @@ export class BedrockChatProvider implements LanguageModelChatProvider {
 		options: { silent: boolean },
 		_token: CancellationToken
 	): Promise<LanguageModelChatInformation[]> {
-		return await this.modelService.getLanguageModelChatInformation(options.silent ?? false);
+		const infos = await this.modelService.getLanguageModelChatInformation(options.silent ?? false);
+		// Announce completion rather than have listeners poll: the discovered output
+		// ceilings are not knowable until this resolves.
+		this.discoveryCompleted.fire();
+		return infos;
 	}
 
 	/**

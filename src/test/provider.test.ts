@@ -5,12 +5,27 @@ import { ConfigurationService } from "../services/configuration.service";
 import { AuthenticationService } from "../services/authentication.service";
 import { convertMessages, detectImageFormat, reconcileToolBlocks, collectToolResultText } from "../converters/messages";
 import { convertTools } from "../converters/tools";
-import { validateRequest, validateTools } from "../validation";
+import {
+	validateRequest,
+	validateTools,
+	describeThinkingBudgetConflict,
+	explainBedrockValidationError,
+	checkTokenSettings,
+} from "../validation";
 import { tryParseJSONObject } from "../converters/schema";
 import { ToolCallBufferManager } from "../tool-buffer";
 import { getProxyAgent, isPermanentRejection } from "../clients/bedrock.client";
 import { getModelProfile, parseClaudeVersion, anthropicThinkingApi } from "../profiles";
-import { buildRequestInput, budgetForEffort } from "../converters/request";
+import type { ThinkingEffort } from "../converters/request";
+import {
+	buildRequestInput,
+	budgetForEffort,
+	resolveMaxTokens,
+	minMaxTokensForEffort,
+	MIN_THINKING_BUDGET,
+	MIN_ANSWER_TOKENS,
+	LAST_RESORT_MAX_OUTPUT_TOKENS,
+} from "../converters/request";
 import { applyCachePoints } from "../converters/cache-points";
 import { StreamProcessor } from "../stream-processor";
 import { createThinkingReporter, getThinkingPartCtor, resetThinkingPartCache } from "../thinking";
@@ -23,12 +38,23 @@ import {
 	manualModelToSummary,
 	defaultMaxOutputTokens,
 	expandEffortVariants,
+	resolveOutputCeiling,
 } from "../services/model.service";
+import {
+	assessEffort,
+	assessAllEfforts,
+	describeAvailability,
+	detailForAvailability,
+	iconForAvailability,
+} from "../effort-availability";
+import { formatConfigurationReport } from "../commands/show-configuration";
 import {
 	THINKING_EFFORTS,
 	decodeVariantId,
 	encodeVariantId,
 	resolveThinkingForTurn,
+	isThinkingEffort,
+	OFF_VARIANT,
 } from "../thinking-variants";
 import type { BedrockMessage, BedrockSystemBlock, BedrockToolResultBlock } from "../types";
 
@@ -804,6 +830,286 @@ suite("Bedrock Chat Provider Extension", () => {
 			assert.equal(built.inferenceConfig!.maxTokens, 1234);
 		});
 
+		test("a maxOutputTokens setting of 0 means the model ceiling, never 1", () => {
+			// The shipped default for the setting is 0, documented as "use the model
+			// maximum". The builder selected it with `?? modelCeiling`, which only
+			// falls through on null/undefined, so a literal 0 won the chain and every
+			// request Copilot did not attach its own max_tokens to went out with
+			// maxTokens: 1. The 0 case was the one value never covered by a test.
+			for (const sentinel of [0, undefined, -1, Number.NaN] as (number | undefined)[]) {
+				const built = buildRequestInput({
+					model: { id: "anthropic.claude-sonnet-4-5-20250929-v1:0", maxOutputTokens: 64000 },
+					converted: baseConverted,
+					options: {} as vscode.LanguageModelChatRequestHandleOptions,
+					profile: getModelProfile("anthropic.claude-sonnet-4-5-20250929-v1:0"),
+					toolConfig: undefined,
+					maxOutputTokensOverride: sentinel,
+				});
+				assert.equal(
+					built.input.inferenceConfig!.maxTokens,
+					64000,
+					`sentinel ${String(sentinel)} must fall through to the model ceiling`
+				);
+				assert.equal(built.maxTokens.source, "model-ceiling");
+			}
+		});
+
+		test("the default configuration plus thinking produces a valid pair", () => {
+			// The exact reported failure: maxOutputTokens unset (0), thinking on at
+			// effort high. Bedrock rejected it with "max_tokens must be greater than
+			// thinking.budget_tokens" because maxTokens had resolved to 1.
+			for (const id of ["anthropic.claude-opus-5", "anthropic.claude-3-7-sonnet-20250219-v1:0"]) {
+				const built = buildRequestInput({
+					model: { id, maxOutputTokens: 64000 },
+					converted: baseConverted,
+					options: {} as vscode.LanguageModelChatRequestHandleOptions,
+					profile: getModelProfile(id),
+					toolConfig: undefined,
+					maxOutputTokensOverride: 0,
+					thinking: { enabled: true, effort: "high", budgetTokens: 0 },
+				});
+				assert.equal(built.thinkingEnabled, true, `${id} should have thinking on`);
+				const maxTokens = built.input.inferenceConfig!.maxTokens!;
+				assert.ok(
+					maxTokens >= minMaxTokensForEffort("high"),
+					`${id}: maxTokens ${maxTokens} must leave room for a high-effort budget`
+				);
+				assert.equal(built.maxTokens.conflict, undefined, `${id} must not report a conflict`);
+			}
+		});
+
+		test("the budget is fitted under maxTokens instead of being clamped below Anthropic's floor", () => {
+			// The original bug: the budget was clamped to `maxTokens - 1`, which cannot
+			// go below the 1024-token floor, so a small limit produced an invalid pair
+			// rather than a smaller budget. A ceiling that cannot seat the full xhigh
+			// budget must still yield a valid budget/answer split.
+			const built = buildRequestInput({
+				model: { id: "anthropic.claude-3-7-sonnet-20250219-v1:0", maxOutputTokens: 8192 },
+				converted: baseConverted,
+				options: {} as vscode.LanguageModelChatRequestHandleOptions,
+				profile: getModelProfile("anthropic.claude-3-7-sonnet-20250219-v1:0"),
+				toolConfig: undefined,
+				thinking: { enabled: true, effort: "xhigh", budgetTokens: 0 },
+			});
+			const fields = built.input.additionalModelRequestFields as AdditionalFields;
+			const budget = fields.reasoning_config!.budget_tokens!;
+			const maxTokens = built.input.inferenceConfig!.maxTokens!;
+
+			assert.equal(maxTokens, 8192, "an unset setting uses the model ceiling in full");
+			assert.ok(budget >= MIN_THINKING_BUDGET, `budget ${budget} must clear Anthropic's floor`);
+			assert.ok(
+				maxTokens - budget >= MIN_ANSWER_TOKENS,
+				`maxTokens ${maxTokens} must leave >= ${MIN_ANSWER_TOKENS} for the answer, budget was ${budget}`
+			);
+			assert.ok(
+				budget < budgetForEffort("xhigh"),
+				"the xhigh budget does not fit an 8192 ceiling, so it must have been reduced"
+			);
+			assert.equal(built.thinkingEnabled, true, "thinking must survive, not be dropped");
+		});
+
+		test("adaptive models also get maxTokens floored for their self-chosen budget", () => {
+			// No budget is sent on the adaptive API, but the service still derives one
+			// from the effort level — which is why an adaptive-only model could return
+			// a thinking.budget_tokens error despite never receiving that field.
+			const built = buildRequestInput({
+				model: { id: "anthropic.claude-sonnet-4-6", maxOutputTokens: 64000 },
+				converted: baseConverted,
+				options: {} as vscode.LanguageModelChatRequestHandleOptions,
+				profile: getModelProfile("anthropic.claude-sonnet-4-6"),
+				toolConfig: undefined,
+				maxOutputTokensOverride: 0,
+				thinking: { enabled: true, effort: "xhigh", budgetTokens: 0 },
+			});
+			const fields = built.input.additionalModelRequestFields as AdditionalFields;
+			assert.deepEqual(fields.thinking, { type: "adaptive" });
+			assert.equal(fields.reasoning_config, undefined, "adaptive models must not get a budget");
+			assert.ok(
+				built.input.inferenceConfig!.maxTokens! >= minMaxTokensForEffort("xhigh"),
+				"adaptive requests still need headroom for the model's own budget"
+			);
+		});
+
+		test("an explicit cap too small for the effort is reported, not silently overridden", () => {			const built = buildRequestInput({
+				model: { id: "anthropic.claude-sonnet-4-6", maxOutputTokens: 64000 },
+				converted: baseConverted,
+				options: {} as vscode.LanguageModelChatRequestHandleOptions,
+				profile: getModelProfile("anthropic.claude-sonnet-4-6"),
+				toolConfig: undefined,
+				maxOutputTokensOverride: 500,
+				thinking: { enabled: true, effort: "high", budgetTokens: 0 },
+			});
+			assert.equal(built.input.inferenceConfig!.maxTokens, 500, "an explicit cap is still honoured");
+			assert.equal(built.thinkingEnabled, false, "thinking must be dropped rather than sent invalid");
+			assert.ok(built.maxTokens.conflict, "the impossible combination must be reported");
+			assert.equal(built.maxTokens.conflict!.source, "setting");
+			assert.equal(built.input.additionalModelRequestFields, undefined);
+		});
+
+		test("adaptive models lower the effort when a caller-supplied max_tokens cannot fit it", () => {
+			// The reported production failure, second form. Copilot supplies its own
+			// small `max_tokens` for utility calls (titles, summaries). On the adaptive
+			// API the request carries only `output_config.effort` and the service
+			// derives the budget from it, so there is no budget to shrink — sending
+			// "high" anyway produced:
+			//   `max_tokens` must be greater than `thinking.budget_tokens`
+			// The only lever is the effort itself.
+			const built = buildRequestInput({
+				model: { id: "anthropic.claude-opus-5", maxOutputTokens: 128000 },
+				converted: baseConverted,
+				options: { modelOptions: { max_tokens: 8192 } } as unknown as vscode.LanguageModelChatRequestHandleOptions,
+				profile: getModelProfile("anthropic.claude-opus-5"),
+				toolConfig: undefined,
+				maxOutputTokensOverride: 0,
+				thinking: { enabled: true, effort: "high", budgetTokens: 0 },
+			});
+
+			assert.equal(built.thinkingEnabled, true, "thinking should survive, just at a lower level");
+			assert.equal(built.input.inferenceConfig!.maxTokens, 8192, "the caller's cap is honoured");
+			const fields = built.input.additionalModelRequestFields as AdditionalFields;
+			const sent = fields.output_config!.effort as ThinkingEffort;
+			assert.equal(sent, "low", `8192 tokens only fits "low", got "${sent}"`);
+			assert.equal(built.maxTokens.effortDowngradedFrom, "high", "the reduction must be reported");
+			assert.ok(
+				built.input.inferenceConfig!.maxTokens! >= minMaxTokensForEffort(sent),
+				"the level actually sent must fit the limit"
+			);
+		});
+
+		test("a fitting effort is never raised above what was requested", () => {
+			// Fitting is not optimizing: silently spending more on reasoning than the
+			// user asked for would be a surprise, and a costly one.
+			const built = buildRequestInput({
+				model: { id: "anthropic.claude-opus-5", maxOutputTokens: 128000 },
+				converted: baseConverted,
+				options: {} as vscode.LanguageModelChatRequestHandleOptions,
+				profile: getModelProfile("anthropic.claude-opus-5"),
+				toolConfig: undefined,
+				maxOutputTokensOverride: 0,
+				thinking: { enabled: true, effort: "low", budgetTokens: 0 },
+			});
+			const fields = built.input.additionalModelRequestFields as AdditionalFields;
+			assert.equal(fields.output_config!.effort, "low", "plenty of room must not promote the level");
+			assert.equal(built.maxTokens.effortDowngradedFrom, undefined);
+		});
+
+		test("adaptive thinking is dropped when even the lowest effort cannot fit", () => {
+			const built = buildRequestInput({
+				model: { id: "anthropic.claude-opus-5", maxOutputTokens: 128000 },
+				converted: baseConverted,
+				options: { modelOptions: { max_tokens: 3000 } } as unknown as vscode.LanguageModelChatRequestHandleOptions,
+				profile: getModelProfile("anthropic.claude-opus-5"),
+				toolConfig: undefined,
+				maxOutputTokensOverride: 0,
+				thinking: { enabled: true, effort: "high", budgetTokens: 0 },
+			});
+			assert.equal(built.thinkingEnabled, false, "better to drop thinking than send an invalid pair");
+			assert.equal(built.input.additionalModelRequestFields, undefined);
+			assert.equal(built.input.inferenceConfig!.maxTokens, 3000, "the caller's cap is still honoured");
+		});
+
+		test("invariant: every effort x thinking API x maxOutputTokens combination is valid", () => {
+			// Property-style sweep over the whole family, because every bug in this
+			// area has been a single point in this space that no example test covered.
+			//
+			// `request` is included as a dimension after the second production
+			// failure: the sweep originally varied only the *setting*, so a
+			// caller-supplied `max_tokens` — which is what Copilot sends for utility
+			// calls — was never exercised, and that is exactly where the adaptive API
+			// broke.
+			const models = [
+				{ id: "anthropic.claude-sonnet-4-6", api: "adaptive" },
+				{ id: "anthropic.claude-opus-5", api: "adaptive" },
+				{ id: "anthropic.claude-3-7-sonnet-20250219-v1:0", api: "budget" },
+			] as const;
+			const settings = [0, 1, 500, 1024, 4096, 32000, 999999, undefined];
+			const requests = [undefined, 1, 500, 3000, 6144, 8192, 12288, 20480, 999999];
+
+			for (const m of models) {
+				assert.equal(getModelProfile(m.id).thinkingApi, m.api, `${m.id} profile changed`);
+				for (const effort of THINKING_EFFORTS) {
+					for (const setting of settings) {
+						for (const request of requests) {
+						for (const ceiling of [8192, 32000, 128000]) {
+							const built = buildRequestInput({
+								model: { id: m.id, maxOutputTokens: ceiling },
+								converted: baseConverted,
+								options: (request === undefined
+									? {}
+									: { modelOptions: { max_tokens: request } }) as unknown as vscode.LanguageModelChatRequestHandleOptions,
+								profile: getModelProfile(m.id),
+								toolConfig: undefined,
+								maxOutputTokensOverride: setting,
+								thinking: { enabled: true, effort, budgetTokens: 0 },
+							});
+							const where = `${m.id} effort=${effort} setting=${String(setting)} request=${String(request)} ceiling=${ceiling}`;
+							const maxTokens = built.input.inferenceConfig!.maxTokens!;
+
+							assert.ok(maxTokens >= 1, `${where}: maxTokens must be positive`);
+							assert.ok(maxTokens <= ceiling, `${where}: maxTokens ${maxTokens} exceeded ceiling`);
+
+							const fields = built.input.additionalModelRequestFields as AdditionalFields | undefined;
+							const budget = fields?.reasoning_config?.budget_tokens;
+
+							// The adaptive API sends no budget, so the level it *does* send
+							// must be one whose server-derived budget fits — and must never
+							// exceed what was asked for.
+							if (built.thinkingEnabled && m.api === "adaptive") {
+								const sent = fields?.output_config?.effort as ThinkingEffort | undefined;
+								assert.ok(sent, `${where}: adaptive request sent no effort`);
+								assert.ok(
+									maxTokens >= minMaxTokensForEffort(sent!),
+									`${where}: sent "${sent}" needing ${minMaxTokensForEffort(sent!)} with only ${maxTokens}`
+								);
+								assert.ok(
+									THINKING_EFFORTS.indexOf(sent!) <= THINKING_EFFORTS.indexOf(effort),
+									`${where}: effort was raised to "${sent}"`
+								);
+							}
+
+							if (built.thinkingEnabled) {
+								assert.ok(
+									maxTokens >= MIN_THINKING_BUDGET + MIN_ANSWER_TOKENS,
+									`${where}: thinking enabled with only ${maxTokens} output tokens`
+								);
+								if (budget !== undefined) {
+									assert.ok(budget >= MIN_THINKING_BUDGET, `${where}: budget ${budget} below the floor`);
+									assert.ok(budget < maxTokens, `${where}: budget ${budget} >= maxTokens ${maxTokens}`);
+								}
+							} else {
+								assert.equal(fields, undefined, `${where}: thinking fields sent with thinking off`);
+								// Thinking is dropped either because an explicit cap conflicts, or
+								// because the adaptive API has no level small enough to fit.
+								const explained =
+									built.maxTokens.conflict !== undefined ||
+									(m.api === "adaptive" && maxTokens < minMaxTokensForEffort("low"));
+								assert.ok(explained, `${where}: thinking dropped without explanation`);
+							}
+
+							// Nobody chose a value at all, so the model ceiling must be used in full.
+							if ((setting === undefined || setting === 0) && request === undefined) {
+								assert.equal(
+									maxTokens,
+									ceiling,
+									`${where}: unset setting produced ${maxTokens} rather than the ceiling`
+								);
+							}
+						}
+						}
+					}
+				}
+			}
+		});
+
+		test("resolveMaxTokens falls back when the model reports no ceiling", () => {
+			const noCeiling = resolveMaxTokens({ modelCeiling: 0 });
+			assert.equal(noCeiling.maxTokens, LAST_RESORT_MAX_OUTPUT_TOKENS);
+
+			const withFallback = resolveMaxTokens({ modelCeiling: undefined, fallbackCeiling: 32000 });
+			assert.equal(withFallback.maxTokens, 32000);
+			assert.equal(withFallback.ceiling, 32000);
+		});
+
 		test("adaptive thinking models get thinking + output_config effort", () => {
 			const built = buildRequestInput({
 				model: { id: "anthropic.claude-sonnet-4-6", maxOutputTokens: 64000 },
@@ -838,6 +1144,10 @@ suite("Bedrock Chat Provider Extension", () => {
 				reasoning.budget_tokens !== undefined &&
 					reasoning.budget_tokens < built.input.inferenceConfig!.maxTokens!,
 				"budget must leave room for the answer"
+			);
+			assert.ok(
+				built.input.inferenceConfig!.maxTokens! - reasoning.budget_tokens! >= MIN_ANSWER_TOKENS,
+				"the answer allowance must be usable, not a single token"
 			);
 		});
 
@@ -1170,6 +1480,410 @@ suite("Bedrock Chat Provider Extension", () => {
 			const map = { "anthropic.claude-haiku-4-5-20251001-v1:0": "arn:aws:bedrock:ap-southeast-2:123456789012:application-inference-profile/abc123" };
 			setConfigurationProvider(() => ({ get: (k: string) => (k === "inferenceProfileOverrides" ? map : undefined) }));
 			assert.deepEqual(new ConfigurationService().getInferenceProfileOverrides(), map);
+		});
+	});
+
+	suite("configuration: token-limit sentinels", () => {
+		let original: typeof vscode.workspace.getConfiguration;
+		setup(() => { original = vscode.workspace.getConfiguration; });
+		teardown(() => setConfigurationProvider(original));
+
+		/** Stub one setting key, everything else unset. */
+		const withSetting = (key: string, value: unknown) =>
+			setConfigurationProvider(() => ({ get: (k: string) => (k === key ? value : undefined) }));
+
+		test("getMaxOutputTokens returns undefined, never 0, for the unset default", () => {
+			// The bug lived in the seam: the service returned 0 as "use the model
+			// maximum", and the caller selected it with `??`, which does not treat 0
+			// as absent. Destroying the sentinel here is what makes the seam safe, so
+			// the service is asserted directly rather than only through the builder.
+			for (const value of [undefined, 0, -5, Number.NaN, "nonsense"]) {
+				withSetting("maxOutputTokens", value);
+				assert.strictEqual(
+					new ConfigurationService().getMaxOutputTokens(),
+					undefined,
+					`value ${String(value)} must read as unset`
+				);
+			}
+		});
+
+		test("getMaxOutputTokens returns a positive integer when set", () => {
+			withSetting("maxOutputTokens", 8192);
+			assert.strictEqual(new ConfigurationService().getMaxOutputTokens(), 8192);
+			withSetting("maxOutputTokens", 8192.7);
+			assert.strictEqual(new ConfigurationService().getMaxOutputTokens(), 8192, "must be an integer");
+		});
+
+		test("getThinkingBudgetTokens returns undefined for the derive-from-effort sentinel", () => {
+			for (const value of [undefined, 0, -1]) {
+				withSetting("thinking.budgetTokens", value);
+				assert.strictEqual(new ConfigurationService().getThinkingBudgetTokens(), undefined);
+			}
+		});
+
+		test("getThinkingBudgetTokens raises sub-floor values to Anthropic's minimum", () => {
+			withSetting("thinking.budgetTokens", 100);
+			assert.strictEqual(new ConfigurationService().getThinkingBudgetTokens(), MIN_THINKING_BUDGET);
+			withSetting("thinking.budgetTokens", 20000);
+			assert.strictEqual(new ConfigurationService().getThinkingBudgetTokens(), 20000);
+		});
+
+		test("the service's unset values feed the builder without capping the model", () => {
+			// End-to-end over the seam: what the service actually returns for a
+			// default install must produce the model ceiling, not 1.
+			setConfigurationProvider(() => ({ get: () => undefined }));
+			const config = new ConfigurationService();
+			const built = buildRequestInput({
+				model: { id: "anthropic.claude-sonnet-4-6", maxOutputTokens: 128000 },
+				converted: {
+					messages: [{ role: "user", content: [{ text: "hi" }] }],
+					system: [],
+				},
+				options: {} as vscode.LanguageModelChatRequestHandleOptions,
+				profile: getModelProfile("anthropic.claude-sonnet-4-6"),
+				maxOutputTokensOverride: config.getMaxOutputTokens(),
+				thinking: { enabled: true, effort: "high", budgetTokens: config.getThinkingBudgetTokens() },
+			});
+			assert.equal(built.input.inferenceConfig!.maxTokens, 128000);
+			assert.equal(built.thinkingEnabled, true);
+		});
+	});
+
+	suite("token-limit error guidance", () => {
+		test("a too-small setting names the setting and the 0 remedy", () => {
+			const msg = describeThinkingBudgetConflict({
+				maxTokens: 500,
+				requiredMaxTokens: 20480,
+				effort: "high",
+				source: "setting",
+				ceiling: 128000,
+			});
+			assert.ok(msg.includes("maxOutputTokens"), "must name the setting");
+			assert.ok(msg.includes("0"), "must offer the model-maximum remedy");
+			assert.ok(msg.includes("high"), "must name the effort level");
+		});
+
+		test("a cap the model cannot reach tells the user to lower the effort instead", () => {
+			// requiredMaxTokens must exceed the ceiling for this branch: when the
+			// requirement fits within the model's own maximum, setting the cap to 0 is
+			// the correct advice, and only when it does not is lowering the effort the
+			// only remedy.
+			const msg = describeThinkingBudgetConflict({
+				maxTokens: 500,
+				requiredMaxTokens: minMaxTokensForEffort("xhigh"),
+				effort: "xhigh",
+				source: "setting",
+				ceiling: 4096,
+			});
+			assert.ok(msg.includes("thinking.effort"), `must point at the effort setting, got: ${msg}`);
+			assert.ok(msg.includes("4,096"), "must state the model's actual maximum");
+			assert.ok(!msg.includes("to 0 to use"), "offering the model maximum would not help here");
+		});
+
+		test("Bedrock's max_tokens/budget_tokens rejection is translated", () => {
+			const raw =
+				"The model returned the following errors: `max_tokens` must be greater than `thinking.budget_tokens`.";
+			const explained = explainBedrockValidationError(raw, {
+				maxTokens: 1,
+				effort: "high",
+				thinkingEnabled: true,
+			});
+			assert.ok(explained, "this is the reported error and must be recognized");
+			assert.ok(explained!.includes("maxOutputTokens"), "must name a setting the user can change");
+			assert.ok(explained!.includes(raw), "must keep the original for diagnosis");
+		});
+
+		test("unrelated errors are left alone", () => {
+			assert.equal(
+				explainBedrockValidationError("AccessDeniedException: not authorized", { thinkingEnabled: true }),
+				undefined
+			);
+		});
+	});
+
+	suite("effort availability", () => {
+		const CEILING = 128000;
+
+		test("every level fits when the output limit is unset", () => {
+			const all = assessAllEfforts({ ceiling: CEILING, api: "adaptive" });
+			assert.equal(all.length, THINKING_EFFORTS.length);
+			for (const a of all) {
+				assert.equal(a.fit, "fits", `${a.effort} should fit a ${CEILING}-token ceiling`);
+				assert.equal(iconForAvailability(a), undefined, `${a.effort} needs no warning icon`);
+				assert.equal(detailForAvailability(a), undefined, `${a.effort} needs no detail`);
+			}
+		});
+
+		test("a small explicit cap makes high levels unusable", () => {
+			const all = assessAllEfforts({ ceiling: CEILING, settingMaxTokens: 500, api: "adaptive" });
+			for (const a of all) {
+				assert.equal(a.fit, "impossible", `${a.effort} cannot work with a 500-token cap`);
+				assert.equal(iconForAvailability(a), "error");
+				assert.equal(a.limitedBySetting, true, "the setting is what constrains it");
+				const detail = detailForAvailability(a);
+				assert.ok(detail?.includes("maxOutputTokens"), "detail must name the setting");
+				assert.ok(detail?.includes("0"), "detail must offer the model-maximum remedy");
+			}
+		});
+
+		test("a model ceiling too small for a level is reported as the model's limit, not the setting's", () => {
+			// A budget-API model can shrink its budget, so a 4096 ceiling is usable but
+			// tight rather than impossible — and the cause is the model, not a setting.
+			const a = assessEffort({ effort: "xhigh", ceiling: 4096, api: "budget" });
+			assert.equal(a.fit, "tight");
+			assert.equal(a.limitedBySetting, false);
+			assert.equal(iconForAvailability(a), "warning");
+			const detail = detailForAvailability(a);
+			assert.ok(detail?.includes("this model allows"), `expected a model-limited message, got: ${detail}`);
+			assert.ok(!detail?.includes("maxOutputTokens"), "must not blame a setting the user did not set");
+		});
+
+		test("an adaptive model whose ceiling cannot fit even the lowest level reports impossible", () => {
+			// The adaptive API cannot shrink a budget — the service derives it from the
+			// effort level — so a ceiling below the lowest level's requirement means no
+			// reasoning at all, not merely reduced reasoning.
+			const a = assessEffort({ effort: "xhigh", ceiling: 4096, api: "adaptive" });
+			assert.equal(a.fit, "impossible", "4096 cannot fit even low, which needs 6144");
+			assert.equal(iconForAvailability(a), "error");
+			assert.ok(detailForAvailability(a)?.includes("Pick a lower level"));
+		});
+
+		test("an adaptive level that will be silently reduced says which level runs instead", () => {
+			// The case behind the reported production failure: enough room for some
+			// reasoning, but not the level requested.
+			const a = assessEffort({ effort: "high", ceiling: 128000, settingMaxTokens: 8192, api: "adaptive" });
+			assert.equal(a.fit, "tight");
+			assert.equal(a.effectiveEffort, "low", "8192 only fits low");
+			assert.ok(
+				describeAvailability(a).includes('would run as "low"'),
+				`description must name the level that runs, got: ${describeAvailability(a)}`
+			);
+			assert.ok(detailForAvailability(a)?.includes("derives its reasoning budget"));
+		});
+
+		test("descriptions always state the budget, and the shortfall when there is one", () => {
+			const fits = assessEffort({ effort: "low", ceiling: CEILING, api: "adaptive" });
+			assert.ok(describeAvailability(fits).includes("2,048"), "must state the budget");
+
+			const blocked = assessEffort({ effort: "high", ceiling: CEILING, settingMaxTokens: 500, api: "adaptive" });
+			const text = describeAvailability(blocked);
+			assert.ok(text.includes("16,384"), "must still state the budget");
+			assert.ok(text.includes("500"), "must state what is actually available");
+		});
+
+		test("availability agrees with what the request builder would send", () => {
+			// The point of reusing resolveMaxTokens: the quick pick's advice and the
+			// wire request must never disagree, which is the failure mode a second copy
+			// of the precedence logic would reintroduce.
+			for (const setting of [undefined, 500, 4096, 32000]) {
+				for (const effort of THINKING_EFFORTS) {
+					const a = assessEffort({ effort, ceiling: CEILING, settingMaxTokens: setting, api: "adaptive" });
+					const built = buildRequestInput({
+						model: { id: "anthropic.claude-sonnet-4-6", maxOutputTokens: CEILING },
+						converted: {
+							messages: [{ role: "user", content: [{ text: "hi" }] }],
+							system: [],
+						},
+						options: {} as vscode.LanguageModelChatRequestHandleOptions,
+						profile: getModelProfile("anthropic.claude-sonnet-4-6"),
+						maxOutputTokensOverride: setting,
+						thinking: { enabled: true, effort, budgetTokens: 0 },
+					});
+					const where = `effort=${effort} setting=${String(setting)}`;
+					assert.equal(a.resolved, built.input.inferenceConfig!.maxTokens, `${where}: limits disagree`);
+					assert.equal(
+						a.fit === "impossible",
+						!built.thinkingEnabled,
+						`${where}: "impossible" must match thinking actually being dropped`
+					);
+				}
+			}
+		});
+	});
+
+	suite("settings advisories", () => {
+		test("an unset output limit produces no advisory", () => {
+			assert.deepEqual(
+				checkTokenSettings({ maxOutputTokens: undefined, thinkingEnabled: true, thinkingEffort: "high" }),
+				[]
+			);
+		});
+
+		test("a tiny output limit is flagged regardless of thinking", () => {
+			const advisories = checkTokenSettings({
+				maxOutputTokens: 100,
+				thinkingEnabled: false,
+				thinkingEffort: "high",
+			});
+			assert.equal(advisories.length, 1);
+			assert.ok(advisories[0].message.includes("too small for normal use"));
+			assert.ok(advisories[0].message.includes("0"), "must offer the model-maximum remedy");
+		});
+
+		test("a limit too small for the current effort is flagged only while thinking is on", () => {
+			const required = minMaxTokensForEffort("xhigh");
+			const on = checkTokenSettings({
+				maxOutputTokens: 4096,
+				thinkingEnabled: true,
+				thinkingEffort: "xhigh",
+				requiredForEffort: required,
+			});
+			assert.equal(on.length, 1);
+			assert.ok(on[0].message.includes("xhigh"));
+
+			const off = checkTokenSettings({
+				maxOutputTokens: 4096,
+				thinkingEnabled: false,
+				thinkingEffort: "xhigh",
+				requiredForEffort: required,
+			});
+			assert.deepEqual(off, [], "an unused effort level must not be warned about");
+		});
+
+		test("a budget that does not fit the cap is flagged", () => {
+			const advisories = checkTokenSettings({
+				maxOutputTokens: 8192,
+				thinkingEnabled: true,
+				thinkingEffort: "medium",
+				thinkingBudgetTokens: 8192,
+				requiredForEffort: minMaxTokensForEffort("medium"),
+			});
+			assert.ok(
+				advisories.some((a) => a.message.includes("budgetTokens")),
+				`expected a budget advisory, got: ${advisories.map((a) => a.id).join(", ")}`
+			);
+		});
+
+		test("advisory IDs encode the values, so a new bad value is warned about again", () => {
+			const first = checkTokenSettings({ maxOutputTokens: 100, thinkingEnabled: false, thinkingEffort: "low" });
+			const second = checkTokenSettings({ maxOutputTokens: 200, thinkingEnabled: false, thinkingEffort: "low" });
+			assert.notEqual(first[0].id, second[0].id, "changing the value must not be suppressed as a duplicate");
+
+			const repeat = checkTokenSettings({ maxOutputTokens: 100, thinkingEnabled: false, thinkingEffort: "low" });
+			assert.equal(first[0].id, repeat[0].id, "the same value must be suppressible");
+		});
+
+		test("a healthy configuration is silent", () => {
+			assert.deepEqual(
+				checkTokenSettings({
+					maxOutputTokens: 64000,
+					thinkingEnabled: true,
+					thinkingEffort: "high",
+					requiredForEffort: minMaxTokensForEffort("high"),
+				}),
+				[]
+			);
+		});
+	});
+
+	suite("model.service ceiling provenance", () => {
+		test("a manual override wins over everything", () => {
+			const r = resolveOutputCeiling({
+				modelId: "anthropic.claude-sonnet-4-5-20250929-v1:0",
+				manual: 60000,
+				openRouter: 128000,
+			});
+			assert.equal(r.maxOutputTokens, 60000);
+			assert.equal(r.source, "manual");
+		});
+
+		test("OpenRouter is preferred over the conservative table, even when larger", () => {
+			// The whole point: the table caps Claude 4+ at 32000, but Opus 5 allows
+			// 128000, so a user whose network reaches OpenRouter should get the real
+			// figure rather than losing three quarters of their output budget.
+			const r = resolveOutputCeiling({ modelId: "anthropic.claude-opus-5", openRouter: 128000 });
+			assert.equal(r.maxOutputTokens, 128000);
+			assert.equal(r.source, "openrouter");
+			assert.equal(r.tableValue, 32000, "the table value is retained for reporting");
+		});
+
+		test("the table is used, and identified as such, when nothing else is available", () => {
+			const r = resolveOutputCeiling({ modelId: "anthropic.claude-opus-5" });
+			assert.equal(r.maxOutputTokens, defaultMaxOutputTokens("anthropic.claude-opus-5"));
+			assert.equal(r.source, "table");
+		});
+
+		test("unusable reported values fall through instead of capping the model", () => {
+			for (const bad of [0, -1, Number.NaN, undefined]) {
+				const r = resolveOutputCeiling({ modelId: "anthropic.claude-opus-5", openRouter: bad });
+				assert.equal(r.source, "table", `openRouter=${String(bad)} must not be trusted`);
+			}
+			const manualBad = resolveOutputCeiling({
+				modelId: "anthropic.claude-opus-5",
+				manual: 0,
+				openRouter: 128000,
+			});
+			assert.equal(manualBad.source, "openrouter", "a 0 manual override must not win");
+		});
+	});
+
+	suite("configuration report", () => {
+		const baseSnapshot = {
+			region: "us-east-1",
+			authMethod: "api-key" as const,
+			authResolved: true,
+			thinking: {
+				enabled: true,
+				effort: "high" as const,
+				budgetTokens: undefined,
+				display: "native",
+				showEffortVariants: false,
+			},
+			maxOutputTokens: undefined,
+			promptCaching: true,
+			nativeTokenCounting: true,
+			manualModelCount: 0,
+			inferenceProfileOverrideCount: 0,
+			discoveryPending: false,
+			models: [
+				{
+					modelId: "anthropic.claude-opus-5",
+					maxInputTokens: 1000000,
+					maxOutputTokens: 128000,
+					ceilingSource: "openrouter" as const,
+					tableValue: 32000,
+				},
+			],
+		};
+
+		test("reports the resolved limit, not the raw setting", () => {
+			const report = formatConfigurationReport(baseSnapshot);
+			assert.ok(report.includes("128,000"), "must show the resolved ceiling");
+			assert.ok(report.includes("use each model's own maximum"), "must explain the 0 default");
+			assert.ok(report.includes("us-east-1"));
+			assert.ok(report.includes("high"));
+		});
+
+		test("calls out a conflicting configuration", () => {
+			const report = formatConfigurationReport({ ...baseSnapshot, maxOutputTokens: 500 });
+			assert.ok(report.includes("too small for reasoning"), "the blocked model must be marked");
+			assert.ok(report.includes("cannot currently run with reasoning enabled"), "must summarize the problem");
+		});
+
+		test("calls out models that fell back to the built-in table", () => {
+			const report = formatConfigurationReport({
+				...baseSnapshot,
+				models: [{ ...baseSnapshot.models[0], ceilingSource: "table" as const, tableValue: undefined }],
+			});
+			assert.ok(report.includes("built-in ceiling defaults"), "the fallback must be visible");
+		});
+
+		test("says so when discovery has not run, rather than printing an empty table", () => {
+			const report = formatConfigurationReport({ ...baseSnapshot, discoveryPending: true, models: [] });
+			assert.ok(report.includes("has not run yet"));
+		});
+
+		test("never contains credentials", () => {
+			// The report exists to be pasted into bug reports, so this is load-bearing.
+			const report = formatConfigurationReport({
+				...baseSnapshot,
+				authMethod: "profile",
+				authDetail: "my-profile",
+			});
+			assert.ok(report.includes("no credentials are included"), "must say it is safe to paste");
+			for (const term of ["apiKey", "secretAccessKey", "sessionToken", "AWS_BEARER"]) {
+				assert.ok(!report.includes(term), `report must not mention ${term}`);
+			}
 		});
 	});
 
@@ -1743,6 +2457,92 @@ suite("Bedrock Chat Provider Extension", () => {
 				effort: "high",
 				source: "default",
 			});
+		});
+
+		test("the off variant round-trips and is distinguishable from an effort level", () => {
+			const id = encodeVariantId(SONNET, OFF_VARIANT);
+			assert.equal(id, `${SONNET}#think=off`);
+			assert.deepEqual(decodeVariantId(id), { baseId: SONNET, effort: OFF_VARIANT });
+			// "off" must not leak into the effort list: it is the absence of a level,
+			// not a level, and THINKING_EFFORTS drives budget tables and enums.
+			assert.equal(isThinkingEffort(OFF_VARIANT), false);
+			assert.ok(!(THINKING_EFFORTS as readonly string[]).includes(OFF_VARIANT));
+		});
+
+		test("the off variant suppresses a global default that is on", () => {
+			// The whole point of the row: without it the picker could only ever raise
+			// reasoning, never turn it off for a single conversation.
+			assert.deepEqual(resolveThinkingForTurn(OFF_VARIANT, { enabled: true, effort: "high" }), {
+				enabled: false,
+				effort: "high",
+				source: "model-picker",
+			});
+			// And is harmless when the default is already off.
+			assert.deepEqual(resolveThinkingForTurn(OFF_VARIANT, { enabled: false, effort: "low" }), {
+				enabled: false,
+				effort: "low",
+				source: "model-picker",
+			});
+		});
+
+		test("an off variant sends no thinking fields and reserves no output tokens", () => {
+			const built = buildRequestInput({
+				model: { id: SONNET, maxOutputTokens: 128000 },
+				converted: { messages: [{ role: "user", content: [{ text: "hi" }] }], system: [] },
+				options: {} as vscode.LanguageModelChatRequestHandleOptions,
+				profile: getModelProfile(SONNET),
+				maxOutputTokensOverride: 0,
+				// What the handler passes after resolving an "off" pick.
+				thinking: { enabled: false, effort: "high", budgetTokens: 0 },
+			});
+			assert.equal(built.thinkingEnabled, false);
+			assert.equal(built.input.additionalModelRequestFields, undefined);
+			assert.equal(
+				built.input.inferenceConfig!.maxTokens,
+				128000,
+				"with no reasoning there is nothing to reserve output tokens for"
+			);
+		});
+
+		test("the off row appears only when there is a default for it to override", () => {
+			const on = expandEffortVariants(modelInfo(SONNET, "Claude Sonnet 4.6"), {
+				thinkingEnabledByDefault: true,
+			});
+			assert.equal(on.length, 2 + THINKING_EFFORTS.length, "plain + off + one per level");
+			assert.equal(on[0].id, SONNET, "the plain entry still comes first");
+			assert.equal(
+				decodeVariantId(on[1].id).effort,
+				OFF_VARIANT,
+				"off leads the variants, mirroring the status-bar quick pick"
+			);
+			assert.equal(on[1].name, "Claude Sonnet 4.6 · think off");
+			assert.deepEqual(
+				on.slice(2).map((v) => decodeVariantId(v.id).effort),
+				[...THINKING_EFFORTS],
+				"effort levels follow in ascending order"
+			);
+
+			// With the default already off, the plain row does the same job, so
+			// offering both would imply a distinction that does not exist.
+			const off = expandEffortVariants(modelInfo(SONNET, "Claude Sonnet 4.6"), {
+				thinkingEnabledByDefault: false,
+			});
+			assert.equal(off.length, 1 + THINKING_EFFORTS.length);
+			assert.ok(
+				off.every((v) => decodeVariantId(v.id).effort !== OFF_VARIANT),
+				"no off row when the default is off"
+			);
+
+			// Omitting the option must not add the row either, so a caller that has
+			// not been updated cannot accidentally show it.
+			assert.equal(expandEffortVariants(modelInfo(SONNET, "Claude Sonnet 4.6")).length, 1 + THINKING_EFFORTS.length);
+		});
+
+		test("a model with no reasoning mode gets no off row either", () => {
+			const expanded = expandEffortVariants(modelInfo("amazon.nova-pro-v1:0", "Nova Pro"), {
+				thinkingEnabledByDefault: true,
+			});
+			assert.equal(expanded.length, 1, "an off switch for a model that never reasons is noise");
 		});
 
 		test("expansion adds one entry per effort level for a reasoning model", () => {
